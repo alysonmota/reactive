@@ -1,0 +1,12 @@
+[package]
+name = "typed-runtime-prototype"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+diagnostics = []
+verification = []
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
