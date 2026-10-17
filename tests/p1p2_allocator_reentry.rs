@@ -7,6 +7,8 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 use typed_runtime_prototype::Runtime;
+#[path = "../benches/support/evaluation.rs"]
+mod evaluation_strategy;
 
 thread_local! {
     static TARGET: RefCell<Option<Runtime>> = const { RefCell::new(None) };
@@ -57,7 +59,7 @@ static ALLOCATOR: Allocator = Allocator;
 #[test]
 fn allocator_cannot_reborrow_graph_during_alloc_realloc_or_dealloc() {
     for operation in 0..3 {
-        let rt = Runtime::new();
+        let rt = evaluation_strategy::runtime();
         if operation != 0 {
             for _ in 0..8 {
                 rt.create_root().unwrap();
@@ -84,5 +86,34 @@ fn allocator_cannot_reborrow_graph_during_alloc_realloc_or_dealloc() {
             target.borrow_mut().take();
         });
         rt.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn allocator_cannot_reborrow_while_evaluation_arena_grows() {
+    for operation in 0..2 {
+        let rt = evaluation_strategy::runtime();
+        let root = rt.create_root().unwrap();
+        let tail = rt
+            .with_owner(root, |r| {
+                let source = r.signal(0_u64)?;
+                let mut tail = r.memo(move |r| r.get(source))?;
+                for _ in 0..16 {
+                    let previous = tail;
+                    tail = r.memo(move |r| Ok(r.get(previous)? + 1))?;
+                }
+                Ok(tail)
+            })
+            .unwrap();
+        TARGET.with(|target| *target.borrow_mut() = Some(rt.clone()));
+        REJECTED.set(0);
+        OPERATION.set(operation);
+        assert_eq!(rt.get(tail), Ok(16));
+        OPERATION.set(u8::MAX);
+        assert_eq!(REJECTED.get(), 1, "arena operation={operation}");
+        rt.verify_invariants().unwrap();
+        TARGET.with(|target| {
+            target.borrow_mut().take();
+        });
     }
 }

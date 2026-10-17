@@ -49,6 +49,11 @@ opt-level = 3
 panic = "abort"
 strip = "symbols"
 
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
+
 [profile.fast-dev]
 inherits = "dev"
 opt-level = 2

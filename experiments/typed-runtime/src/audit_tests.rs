@@ -4,6 +4,15 @@ use super::*;
 use production_support::{effect, flush, forge, memo, pair, revisions, signal, sources};
 use std::cell::RefCell;
 
+// Private fault-injection cases deliberately need a physical scope to alter
+// its generation or install a cleanup. Plain reads now keep it logical.
+fn materialized_scope(r: &Runtime, key: Key) -> Key {
+    r.graph(|g| {
+        let epoch = g.cold[key.index as usize].as_ref().unwrap().scope_epoch;
+        ownership::materialize(g, ownership::PendingOwner { node: key, epoch }).unwrap()
+    })
+}
+
 #[test]
 fn deferred_effects_lazy_memos_reuse_two_cells_and_do_not_own_values() {
     struct Value(u32, Rc<Cell<usize>>);
@@ -982,13 +991,7 @@ fn owner_generations_renew_without_wrap_and_depth_overflow_is_local() {
     let trigger = signal(&r, o, 0);
     let m = memo(&r, o, move |r| r.get(trigger));
     r.get(m).unwrap();
-    let old = r.graph(|g| {
-        g.cold[m.key.index as usize]
-            .as_ref()
-            .unwrap()
-            .execution_owner
-            .unwrap()
-    });
+    let old = materialized_scope(&r, m.key);
     r.graph(|g| {
         let new = ownership::set_generation(g, old, u32::MAX);
         g.cold[m.key.index as usize]
@@ -998,13 +1001,7 @@ fn owner_generations_renew_without_wrap_and_depth_overflow_is_local() {
     });
     r.set(trigger, 1).unwrap();
     r.get(m).unwrap();
-    let new = r.graph(|g| {
-        g.cold[m.key.index as usize]
-            .as_ref()
-            .unwrap()
-            .execution_owner
-            .unwrap()
-    });
+    let new = materialized_scope(&r, m.key);
     assert_ne!(old.index, new.index);
     assert_eq!(r.owner_count(), 2);
     r.verify_invariants().unwrap();
@@ -1076,13 +1073,7 @@ fn resourceful_memo_cleanup_retains_purity_and_restores_context_before_notify() 
     let source = signal(&r, o, 0);
     let m = memo(&r, o, move |r| r.get(source));
     r.get(m).unwrap();
-    let scope = r.graph(|g| {
-        g.cold[m.key.index as usize]
-            .as_ref()
-            .unwrap()
-            .execution_owner
-            .unwrap()
-    });
+    let scope = materialized_scope(&r, m.key);
     let weak = other.downgrade();
     let c = calls.clone();
     r.with_owner(r.owner_handle(scope), |r| {

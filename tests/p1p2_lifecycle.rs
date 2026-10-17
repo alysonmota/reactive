@@ -5,13 +5,15 @@ use std::{
     time::Instant,
 };
 use typed_runtime_prototype::{Error, FlushOptions, FlushOutcome, Runtime};
+#[path = "../benches/support/evaluation.rs"]
+mod evaluation_strategy;
 
 #[test]
 fn no_implicit_owner_and_memo_capabilities_cannot_be_widened() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     assert_eq!(rt.signal(0_u64).unwrap_err(), Error::MissingOwner);
     let root = rt.create_root().unwrap();
-    let other = Runtime::new();
+    let other = evaluation_strategy::runtime();
     let foreign = other.create_root().unwrap();
     let captured = other.clone();
     let memo = rt
@@ -43,7 +45,7 @@ fn no_implicit_owner_and_memo_capabilities_cannot_be_widened() {
 #[test]
 fn cleanup_failure_and_panic_drain_all_independent_resources() {
     for panic in [false, true] {
-        let rt = Runtime::new();
+        let rt = evaluation_strategy::runtime();
         let root = rt.create_root().unwrap();
         let child = rt.create_owner(root).unwrap();
         let calls = Rc::new(RefCell::new(Vec::new()));
@@ -89,7 +91,7 @@ fn cleanup_failure_and_panic_drain_all_independent_resources() {
 }
 #[test]
 fn disposed_execution_continues_but_cannot_register_resources() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     let root = rt.create_root().unwrap();
     let done = Rc::new(Cell::new(false));
     let flag = done.clone();
@@ -109,7 +111,7 @@ fn disposed_execution_continues_but_cannot_register_resources() {
 }
 #[test]
 fn deadline_and_work_are_cooperative_and_include_equality_cuts() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     let root = rt.create_root().unwrap();
     let s = rt.with_owner(root, |rt| rt.signal(0_u64)).unwrap();
     let m = rt
@@ -148,7 +150,7 @@ fn deadline_and_work_are_cooperative_and_include_equality_cuts() {
 }
 #[test]
 fn weak_runtime_does_not_retain_closures_and_final_drop_skips_cleanups() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     let weak = rt.downgrade();
     let root = rt.create_root().unwrap();
     let called = Rc::new(Cell::new(false));
@@ -166,7 +168,7 @@ fn weak_runtime_does_not_retain_closures_and_final_drop_skips_cleanups() {
 }
 #[test]
 fn cleanup_can_dispose_the_computation_before_it_restarts() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     let root = rt.create_root().unwrap();
     let input = rt.with_owner(root, |rt| rt.signal(0_u64)).unwrap();
     let holder = Rc::new(Cell::new(None));
@@ -194,7 +196,7 @@ fn cleanup_can_dispose_the_computation_before_it_restarts() {
 }
 #[test]
 fn disposed_newly_read_source_requeues_without_resurrecting_an_edge() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     let root = rt.create_root().unwrap();
     let child = rt.create_owner(root).unwrap();
     let input = rt.with_owner(child, |rt| rt.signal(0_u64)).unwrap();
@@ -216,7 +218,7 @@ fn disposed_newly_read_source_requeues_without_resurrecting_an_edge() {
 
 #[test]
 fn shutdown_inside_effect_detaches_every_root_before_callbacks() {
-    let rt = Runtime::new();
+    let rt = evaluation_strategy::runtime();
     let a = rt.create_root().unwrap();
     let b = rt.create_root().unwrap();
     let s = rt.with_owner(b, |rt| rt.signal(7_u64)).unwrap();
@@ -250,7 +252,7 @@ fn shutdown_inside_effect_detaches_every_root_before_callbacks() {
 #[test]
 fn host_scope_panics_poison_without_notifying_and_restore_context() {
     for kind in 0..3 {
-        let rt = Runtime::new();
+        let rt = evaluation_strategy::runtime();
         let root = rt.create_root().unwrap();
         let calls = Rc::new(Cell::new(0));
         let count = calls.clone();

@@ -7,6 +7,7 @@ publish = false
 [features]
 diagnostics = []
 verification = []
+topology-diagnostics = ["diagnostics"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

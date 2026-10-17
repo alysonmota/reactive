@@ -15,6 +15,18 @@ impl WeakRuntime {
     }
 }
 type Cleanup = Box<dyn FnMut(&Runtime) -> Result<()>>;
+// A logical execution scope has no public handle until materialization. Its
+// node generation + epoch prevent a suspended context attaching to a new run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PendingOwner {
+    pub node: Key,
+    pub epoch: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Child {
+    Physical(Key),
+    Deferred(Key),
+}
 pub(super) struct OwnerSlot {
     generation: u32,
     value: Option<Owner>,
@@ -27,7 +39,7 @@ pub(super) fn set_generation(g: &mut Graph, key: Key, generation: u32) -> Key {
     let new = Key { generation, ..key };
     g.owners[key.index as usize].generation = generation;
     if let Some(parent) = parent {
-        owner_mut(g, parent).unwrap().children[pos] = new;
+        owner_mut(g, parent).unwrap().children[pos] = Child::Physical(new);
     } else {
         g.roots[pos] = new;
     }
@@ -37,7 +49,7 @@ pub(super) struct Owner {
     parent: Option<Key>,
     position: usize,
     pub depth: usize,
-    children: Vec<Key>,
+    children: Vec<Child>,
     pub nodes: Vec<Key>,
     cleanups: Vec<Cleanup>,
 }
@@ -62,6 +74,32 @@ pub(super) fn owner_mut(g: &mut Graph, key: Key) -> Result<&mut Owner> {
 }
 pub(super) fn owner_count(g: &mut Graph) -> usize {
     g.owners.iter().filter(|o| o.value.is_some()).count()
+        + g.cold.iter().flatten().filter(|c| c.scope_deferred).count()
+}
+pub(super) fn materialize(g: &mut Graph, pending: PendingOwner) -> Result<Key> {
+    header(g, pending.node).map_err(|_| Error::OwnerDisposed)?;
+    let c = g.cold[pending.node.index as usize].as_ref().unwrap();
+    if c.scope_epoch != pending.epoch {
+        return Err(Error::OwnerDisposed);
+    }
+    if let Some(key) = c.execution_owner {
+        owner(g, key).map_err(|_| Error::OwnerDisposed)?;
+        return Ok(key);
+    }
+    if !c.scope_deferred {
+        return Err(Error::OwnerDisposed);
+    }
+    let parent = c.owner;
+    let position = c.scope_position;
+    if owner(g, parent)?.children.get(position) != Some(&Child::Deferred(pending.node)) {
+        return Err(Error::Invariant);
+    }
+    let key = insert_at(g, Some(parent), Some(position))?;
+    let c = g.cold[pending.node.index as usize].as_mut().unwrap();
+    c.execution_owner = Some(key);
+    c.scope_deferred = false;
+    c.scope_position = usize::MAX;
+    Ok(key)
 }
 #[cfg(feature = "diagnostics")]
 pub(super) fn capacity_bytes(g: &Graph) -> usize {
@@ -70,12 +108,16 @@ pub(super) fn capacity_bytes(g: &Graph) -> usize {
             .iter()
             .filter_map(|s| s.value.as_ref())
             .map(|o| {
-                (o.children.capacity() + o.nodes.capacity()) * std::mem::size_of::<Key>()
+                o.children.capacity() * std::mem::size_of::<Child>()
+                    + o.nodes.capacity() * std::mem::size_of::<Key>()
                     + o.cleanups.capacity() * std::mem::size_of::<Cleanup>()
             })
             .sum::<usize>()
 }
 fn insert(g: &mut Graph, parent: Option<Key>) -> Result<Key> {
+    insert_at(g, parent, None)
+}
+fn insert_at(g: &mut Graph, parent: Option<Key>, reserved: Option<usize>) -> Result<Key> {
     let depth = match parent {
         Some(p) => owner(g, p)?.depth.checked_add(1).ok_or(Error::DepthLimit)?,
         None => 0,
@@ -91,7 +133,7 @@ fn insert(g: &mut Graph, parent: Option<Key>) -> Result<Key> {
         index
     };
     let position = match parent {
-        Some(p) => owner(g, p)?.children.len(),
+        Some(p) => reserved.unwrap_or(owner(g, p)?.children.len()),
         None => g.roots.len(),
     };
     let slot = &mut g.owners[index as usize];
@@ -108,7 +150,11 @@ fn insert(g: &mut Graph, parent: Option<Key>) -> Result<Key> {
         generation: slot.generation,
     };
     if let Some(p) = parent {
-        owner_mut(g, p)?.children.push(key);
+        if reserved.is_some() {
+            owner_mut(g, p)?.children[position] = Child::Physical(key);
+        } else {
+            owner_mut(g, p)?.children.push(Child::Physical(key));
+        }
     } else {
         g.roots.push(key);
     }
@@ -119,17 +165,31 @@ fn swap_remove_key(keys: &mut Vec<Key>, key: Key) {
         keys.swap_remove(i);
     }
 }
+fn remove_child(g: &mut Graph, parent: Key, position: usize, expected: Child) {
+    let siblings = &mut owner_mut(g, parent).unwrap().children;
+    assert_eq!(siblings.swap_remove(position), expected);
+    let moved = siblings.get(position).copied();
+    match moved {
+        Some(Child::Physical(key)) => owner_mut(g, key).unwrap().position = position,
+        Some(Child::Deferred(key)) => {
+            g.cold[key.index as usize].as_mut().unwrap().scope_position = position
+        }
+        None => (),
+    }
+}
 struct Context<'a> {
     rt: &'a Runtime,
     owner: Option<Key>,
     reader: Option<Key>,
     disposal: usize,
+    pending_owner: Option<PendingOwner>,
 }
 impl Drop for Context<'_> {
     fn drop(&mut self) {
         self.rt.0.owner.set(self.owner);
         self.rt.0.reader.set(self.reader);
         self.rt.0.disposal.set(self.disposal);
+        self.rt.0.pending_owner.set(self.pending_owner);
     }
 }
 struct Retired {
@@ -138,8 +198,11 @@ struct Retired {
 }
 
 // Called only with graph access, never calls user code or drops a payload.
-fn detach_node(g: &mut Graph, key: Key) -> Cold {
+fn detach_node(rt: &Runtime, g: &mut Graph, key: Key) -> Cold {
     let c = g.cold[key.index as usize].take().unwrap();
+    if c.scope_deferred && owner(g, c.owner).is_ok() {
+        remove_child(g, c.owner, c.scope_position, Child::Deferred(key));
+    }
     scheduling::cancel(g, key);
     let h = &mut g.hot[key.index as usize];
     h.alive = false;
@@ -152,6 +215,7 @@ fn detach_node(g: &mut Graph, key: Key) -> Cold {
     }
     for observer in &c.observers {
         if header(g, observer.key).is_ok() {
+            shared_plan::local_structure_changed(rt, g, observer.key);
             g.cold[observer.key.index as usize]
                 .as_mut()
                 .unwrap()
@@ -164,7 +228,7 @@ fn detach_node(g: &mut Graph, key: Key) -> Cold {
     c
 }
 // Mark the entire subtree unavailable before extraction or any callback.
-fn detach(g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
+fn detach(rt: &Runtime, g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
     let mut groups = Vec::new();
     for &root in roots {
         if owner(g, root).is_err() {
@@ -174,7 +238,10 @@ fn detach(g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
         let mut i = 0;
         while i < ids.len() {
             let o = owner(g, ids[i]).unwrap();
-            ids.extend_from_slice(&o.children);
+            ids.extend(o.children.iter().filter_map(|c| match c {
+                Child::Physical(key) => Some(*key),
+                Child::Deferred(_) => None,
+            }));
             i += 1;
         }
         groups.push(ids);
@@ -196,17 +263,19 @@ fn detach(g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
                 slot.generation = n;
                 g.owner_free.push(id.index);
             }
-            let siblings = if let Some(p) = o.parent {
-                &mut owner_mut(g, p).unwrap().children
+            if let Some(p) = o.parent {
+                remove_child(g, p, o.position, Child::Physical(id));
             } else {
-                &mut g.roots
-            };
-            assert_eq!(siblings.swap_remove(o.position), id);
-            let moved = siblings.get(o.position).copied();
-            if let Some(moved) = moved {
-                owner_mut(g, moved).unwrap().position = o.position;
+                assert_eq!(g.roots.swap_remove(o.position), id);
+                if let Some(moved) = g.roots.get(o.position).copied() {
+                    owner_mut(g, moved).unwrap().position = o.position;
+                }
             }
-            let nodes = o.nodes.iter().map(|&node| detach_node(g, node)).collect();
+            let nodes = o
+                .nodes
+                .iter()
+                .map(|&node| detach_node(rt, g, node))
+                .collect();
             retired.push(Retired { owner: o, nodes });
         }
     }
@@ -246,11 +315,14 @@ impl Runtime {
     pub fn current_owner(&self) -> Result<Option<OwnerHandle>> {
         self.check(READ)?;
         self.check_current_owner()?;
-        self.0
-            .owner
-            .get()
-            .map(|key| self.graph(|g| owner(g, key).map(|_| self.owner_handle(key))))
-            .transpose()
+        self.current_owner_key()
+            .map(|key| key.map(|key| self.owner_handle(key)))
+    }
+    pub(super) fn current_owner_key(&self) -> Result<Option<Key>> {
+        if let Some(pending) = self.0.pending_owner.get() {
+            return self.graph(|g| materialize(g, pending)).map(Some);
+        }
+        Ok(self.0.owner.get())
     }
     pub fn validate_owner(&self, h: OwnerHandle) -> Result<()> {
         self.check(READ)?;
@@ -276,13 +348,14 @@ impl Runtime {
             owner: self.0.owner.replace(Some(key)),
             reader: self.0.reader.get(),
             disposal: self.0.disposal.get(),
+            pending_owner: self.0.pending_owner.replace(None),
         };
         self.user(|| f.1.take().unwrap()(self))
     }
     pub fn on_cleanup(&self, f: impl FnMut(&Runtime) -> Result<()> + 'static) -> Result<()> {
         let mut callback = Protected(self, Some(Box::new(f) as Cleanup));
         self.check(CREATE)?;
-        let key = self.0.owner.get().ok_or(Error::MissingOwner)?;
+        let key = self.current_owner_key()?.ok_or(Error::MissingOwner)?;
         self.graph(|g| {
             owner_mut(g, key)
                 .map_err(|_| Error::OwnerDisposed)?
@@ -306,7 +379,7 @@ impl Runtime {
         if self.resolve_owner(h).is_err() {
             return Ok(());
         }
-        let retired = self.graph(|g| detach(g, &[h.key]));
+        let retired = self.graph(|g| detach(self, g, &[h.key]));
         self.drain_owners(retired)
     }
     pub(super) fn dispose_node(&self, key: Key) -> Result<()> {
@@ -314,8 +387,8 @@ impl Runtime {
         // Detach the node and its execution subtree before first cleanup.
         let (retired, c) = self.graph(|g| {
             g.hot[key.index as usize].alive = false;
-            let retired = scope.map(|s| detach(g, &[s])).unwrap_or_default();
-            let c = detach_node(g, key);
+            let retired = scope.map(|s| detach(self, g, &[s])).unwrap_or_default();
+            let c = detach_node(self, g, key);
             if let Ok(o) = owner_mut(g, c.owner) {
                 swap_remove_key(&mut o.nodes, key);
             }
@@ -338,10 +411,33 @@ impl Runtime {
     }
     pub(super) fn prepare_execution(&self, key: Key) -> Result<bool> {
         self.next_disposal_depth()?;
-        let (old, parent) = self.graph(|g| {
+        let (old, parent, epoch) = self.graph(|g| {
             let c = g.cold[key.index as usize].as_ref().unwrap();
-            (c.execution_owner, c.owner)
-        });
+            let (old, parent, epoch) = (c.execution_owner, c.owner, c.scope_epoch);
+            if old.is_none() {
+                // Same depth-overflow preflight as allocating a physical owner.
+                owner(g, parent)?
+                    .depth
+                    .checked_add(1)
+                    .ok_or(Error::DepthLimit)?;
+                let c = g.cold[key.index as usize].as_mut().unwrap();
+                if !c.scope_deferred {
+                    let position = owner(g, parent)?.children.len();
+                    owner_mut(g, parent)?.children.push(Child::Deferred(key));
+                    let c = g.cold[key.index as usize].as_mut().unwrap();
+                    c.scope_deferred = true;
+                    c.scope_position = position;
+                }
+            }
+            Ok((old, parent, epoch))
+        })?;
+        if old.is_none() {
+            self.0.owner.set(None);
+            self.0
+                .pending_owner
+                .set(Some(PendingOwner { node: key, epoch }));
+            return Ok(true);
+        }
         // Empty physical scopes renew generations but retain their buffers and
         // index. Handles from the preceding execution must still become stale.
         let renewed = self.graph(|g| {
@@ -359,7 +455,7 @@ impl Runtime {
                     g.owners[old.index as usize].generation = n;
                     let position = owner(g, new)?.position;
                     let p = owner_mut(g, parent)?;
-                    p.children[position] = new;
+                    p.children[position] = Child::Physical(new);
                     return Ok(Some(new));
                 }
             }
@@ -372,23 +468,40 @@ impl Runtime {
                 // Retire the backlink before invoking cleanups: even an Err or
                 // panic must not leave a live node pointing at a dead owner.
                 self.graph(|g| g.cold[key.index as usize].as_mut().unwrap().execution_owner = None);
-                let retired = self.graph(|g| detach(g, &[old]));
+                let retired = self.graph(|g| detach(self, g, &[old]));
                 self.drain_owners(retired)?;
             }
             if self.graph(|g| header(g, key).is_err()) {
                 return Ok(false);
             }
             self.check(READ)?;
-            self.graph(|g| insert(g, Some(parent)))?
+            let epoch = self.graph(|g| {
+                owner(g, parent)?
+                    .depth
+                    .checked_add(1)
+                    .ok_or(Error::DepthLimit)?;
+                let position = owner(g, parent)?.children.len();
+                owner_mut(g, parent)?.children.push(Child::Deferred(key));
+                let c = g.cold[key.index as usize].as_mut().unwrap();
+                c.scope_deferred = true;
+                c.scope_position = position;
+                Ok(c.scope_epoch)
+            })?;
+            self.0.owner.set(None);
+            self.0
+                .pending_owner
+                .set(Some(PendingOwner { node: key, epoch }));
+            return Ok(true);
         };
         self.graph(|g| g.cold[key.index as usize].as_mut().unwrap().execution_owner = Some(new));
         self.0.owner.set(Some(new));
+        self.0.pending_owner.set(None);
         Ok(true)
     }
     pub(super) fn shutdown_owners(&self) -> Result<()> {
         let retired = self.graph(|g| {
             let roots = g.roots.iter().rev().copied().collect::<Vec<_>>();
-            detach(g, &roots)
+            detach(self, g, &roots)
         });
         self.drain_owners(retired)
     }
@@ -399,6 +512,7 @@ impl Runtime {
             owner: self.0.owner.replace(None),
             reader: self.0.reader.replace(None),
             disposal: self.0.disposal.replace(depth),
+            pending_owner: self.0.pending_owner.replace(None),
         };
         let _caps = Caps::enter(READ | WRITE | DISPOSE);
         let _reader = ReaderRuntime::enter(None);
@@ -406,6 +520,7 @@ impl Runtime {
         let mut error = None;
         for mut r in retired {
             while let Some(mut callback) = r.owner.cleanups.pop() {
+                let _callback = shared_plan::Callback::enter(self);
                 match catch_unwind(AssertUnwindSafe(|| callback(self))) {
                     Ok(Ok(())) => (),
                     Ok(Err(e)) => {
@@ -431,6 +546,22 @@ impl Runtime {
         error.map_or(Ok(()), Err)
     }
     fn check_current_owner(&self) -> Result<()> {
+        if let Some(pending) = self.0.pending_owner.get() {
+            return self.graph(|g| {
+                header(g, pending.node).map_err(|_| Error::OwnerDisposed)?;
+                let c = g.cold[pending.node.index as usize].as_ref().unwrap();
+                if c.scope_epoch != pending.epoch {
+                    return Err(Error::OwnerDisposed);
+                }
+                if let Some(key) = c.execution_owner {
+                    owner(g, key).map(|_| ()).map_err(|_| Error::OwnerDisposed)
+                } else if c.scope_deferred {
+                    Ok(())
+                } else {
+                    Err(Error::OwnerDisposed)
+                }
+            });
+        }
         if let Some(key) = self.0.owner.get() {
             self.graph(|g| owner(g, key).map(|_| ()).map_err(|_| Error::OwnerDisposed))?;
         }
@@ -488,7 +619,7 @@ pub(super) fn verify(g: &Graph) -> Result<Vec<bool>> {
             if let Some(p) = o.parent {
                 let p = owner(g, p)?;
                 if p.depth.checked_add(1) != Some(o.depth)
-                    || p.children.get(o.position) != Some(&key)
+                    || p.children.get(o.position) != Some(&Child::Physical(key))
                 {
                     return Err(Error::Invariant);
                 }
@@ -496,8 +627,23 @@ pub(super) fn verify(g: &Graph) -> Result<Vec<bool>> {
                 return Err(Error::Invariant);
             }
             for (position, &child) in o.children.iter().enumerate() {
-                if owner(g, child)?.parent != Some(key) || owner(g, child)?.position != position {
-                    return Err(Error::Invariant);
+                match child {
+                    Child::Physical(child) => {
+                        if owner(g, child)?.parent != Some(key)
+                            || owner(g, child)?.position != position
+                        {
+                            return Err(Error::Invariant);
+                        }
+                    }
+                    Child::Deferred(child) => {
+                        header(g, child)?;
+                        let c = g.cold[child.index as usize]
+                            .as_ref()
+                            .ok_or(Error::Invariant)?;
+                        if c.owner != key || !c.scope_deferred || c.scope_position != position {
+                            return Err(Error::Invariant);
+                        }
+                    }
                 }
             }
             for &node in &o.nodes {

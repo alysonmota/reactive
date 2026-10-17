@@ -2,6 +2,8 @@
 //! root is added to the runtime under test.
 use std::ops::Deref;
 use typed_runtime_prototype::{Handle, OwnerHandle, Result};
+#[path = "../../benches/support/evaluation.rs"]
+mod evaluation_strategy;
 #[derive(Clone)]
 pub struct Runtime {
     inner: typed_runtime_prototype::Runtime,
@@ -9,7 +11,7 @@ pub struct Runtime {
 }
 impl Runtime {
     pub fn new() -> Self {
-        let inner = typed_runtime_prototype::Runtime::new();
+        let inner = evaluation_strategy::runtime();
         let root = inner.create_root().unwrap();
         Self { inner, root }
     }

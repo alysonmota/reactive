@@ -20,20 +20,42 @@ mod audit_tests;
 mod conformance;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
+mod evaluation;
+mod planning;
+#[cfg(test)]
+mod planning_tests;
+pub use planning::EvaluationStrategy;
+mod executable_plan;
 mod failures;
 mod notification;
+#[cfg(test)]
+mod optimization_tests;
+mod ordered;
 mod ownership;
 #[cfg(test)]
 mod production_ports;
 #[cfg(test)]
 mod production_support;
 mod scheduling;
+mod shared_plan;
+#[cfg(feature = "topology-diagnostics")]
+mod topology;
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::*;
+#[cfg(feature = "diagnostics")]
+pub use executable_plan::ExecutablePlanSnapshot;
 pub use failures::RuntimeStatus;
 use failures::capability_error;
+#[cfg(feature = "diagnostics")]
+pub use ordered::{OrderedCounters, OrderedSnapshot};
 pub use ownership::{OwnerHandle, WeakRuntime};
 pub use scheduling::{FlushOptions, FlushOutcome, FlushReport};
+#[cfg(feature = "diagnostics")]
+pub use shared_plan::{SharedPlanCounters, SharedPlanSnapshot};
+#[cfg(feature = "topology-diagnostics")]
+pub use topology::{
+    TopologyPlan, TopologySessionKind, TopologySnapshot, TopologyTrace, TraceRelation,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -204,6 +226,8 @@ struct Cold {
     execution_owner: Option<Key>,
     failure: Option<Rc<Error>>,
     tracking_prefix: bool,
+    scope_deferred: bool,
+    scope_position: usize,
 }
 #[derive(Clone, Copy)]
 struct Descriptor {
@@ -270,6 +294,18 @@ struct Inner {
     status: Cell<u8>, // 0 healthy, 1 poisoned, 2 closed
     flushing: Cell<bool>,
     owner: Cell<Option<Key>>,
+    pending_owner: Cell<Option<ownership::PendingOwner>>,
+    frames: std::cell::RefCell<Vec<evaluation::Frame>>,
+    strategy: EvaluationStrategy,
+    validation_frames: std::cell::RefCell<Vec<planning::Frame>>,
+    plan_epoch: Cell<Option<u64>>,
+    shared_plan: std::cell::RefCell<shared_plan::Storage>,
+    shared_frames: std::cell::RefCell<Vec<shared_plan::Frame>>,
+    ordered: std::cell::RefCell<ordered::Storage>,
+    #[cfg(feature = "topology-diagnostics")]
+    topology_enabled: Cell<bool>,
+    #[cfg(feature = "topology-diagnostics")]
+    topology: std::cell::RefCell<topology::Storage>,
     batch: Cell<usize>,
     disposal: Cell<usize>,
     executions: Cell<usize>,
@@ -287,42 +323,6 @@ fn allocate_identity(counter: &AtomicU64) -> Result<u64> {
     counter
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .map_err(|_| Error::Exhausted)
-}
-
-struct Evaluation<'a> {
-    rt: &'a Runtime,
-    key: Key,
-    reader: Option<Key>,
-    depth: usize,
-    owner: Option<Key>,
-}
-impl Drop for Evaluation<'_> {
-    fn drop(&mut self) {
-        self.rt.0.reader.set(self.reader);
-        self.rt.0.depth.set(self.depth);
-        self.rt.0.owner.set(self.owner);
-        let failure = if self.rt.is_poisoned() {
-            self.rt.first_failure()
-        } else {
-            None
-        };
-        self.rt.graph(|g| {
-            if let Ok(h) = header_mut(g, self.key) {
-                h.phase = EvaluationPhase::Idle;
-                if failure.is_some() {
-                    h.state = State::Dirty;
-                    let c = g.cold[self.key.index as usize].as_mut().unwrap();
-                    c.failure = failure;
-                    c.reads.clear();
-                    c.tracking_prefix = true;
-                }
-            }
-        });
-        #[cfg(feature = "diagnostics")]
-        {
-            self.rt.0.diagnostic.borrow_mut().active.pop();
-        }
-    }
 }
 
 fn header(g: &Graph, key: Key) -> Result<&Hot> {
@@ -345,6 +345,28 @@ impl Default for Runtime {
 }
 impl Runtime {
     pub fn new() -> Self {
+        #[cfg(test)]
+        if let Ok(mode) = std::env::var("TYPED_EVALUATION") {
+            return Self::with_evaluation_strategy(match mode.as_str() {
+                "full" => EvaluationStrategy::FullFrames,
+                "light" => EvaluationStrategy::LightFrames,
+                "topological" => EvaluationStrategy::DemandDriven,
+                "shared" => EvaluationStrategy::SharedPlan,
+                "shared-dirty" => EvaluationStrategy::SharedPlanDirty,
+                "shared-opt" => EvaluationStrategy::SharedPlanOptimized,
+                "shared-dirty-opt" => EvaluationStrategy::SharedPlanDirtyOptimized,
+                "global" => EvaluationStrategy::GlobalPlan,
+                "global-dirty" => EvaluationStrategy::GlobalPlanDirty,
+                "local" => EvaluationStrategy::LocalPlan,
+                "local-dirty" => EvaluationStrategy::LocalPlanDirty,
+                "ordered" => EvaluationStrategy::OrderedDemand,
+                _ => panic!("unknown TYPED_EVALUATION: {mode}"),
+            });
+        }
+        Self::with_evaluation_strategy(EvaluationStrategy::FullFrames)
+    }
+    /// Experimental evaluation policy, fixed for this runtime's lifetime.
+    pub fn with_evaluation_strategy(strategy: EvaluationStrategy) -> Self {
         let id = allocate_identity(&NEXT_RUNTIME).expect("runtime identity exhausted");
         Self(Rc::new(Inner {
             kernel_active: Cell::new(false),
@@ -374,6 +396,18 @@ impl Runtime {
             status: Cell::new(0),
             flushing: Cell::new(false),
             owner: Cell::new(None),
+            pending_owner: Cell::new(None),
+            frames: Default::default(),
+            strategy,
+            validation_frames: Default::default(),
+            plan_epoch: Cell::new(Some(0)),
+            shared_plan: Default::default(),
+            shared_frames: Default::default(),
+            ordered: Default::default(),
+            #[cfg(feature = "topology-diagnostics")]
+            topology_enabled: Cell::new(false),
+            #[cfg(feature = "topology-diagnostics")]
+            topology: Default::default(),
             batch: Cell::new(0),
             disposal: Cell::new(0),
             executions: Cell::new(0),
@@ -442,6 +476,7 @@ impl Runtime {
         Ok(())
     }
     fn user<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _callback = shared_plan::Callback::enter(self);
         match catch_unwind(AssertUnwindSafe(f)) {
             Ok(value) => value,
             Err(panic) => {
@@ -457,6 +492,7 @@ impl Runtime {
         }
         let _caps = Caps::enter(0);
         let _reader = ReaderRuntime::enter(None);
+        let _callback = shared_plan::Callback::enter(self);
         let before = self.failure_count();
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
             if self.failure_count() == before {
@@ -485,7 +521,7 @@ impl Runtime {
         let mut compute = Protected(self, Some(compute));
         let mut equals = Protected(self, Some(equals));
         self.check(CREATE)?;
-        let owner = self.0.owner.get().ok_or(Error::MissingOwner)?;
+        let owner = self.current_owner_key()?.ok_or(Error::MissingOwner)?;
         self.graph(|g| {
             ownership::owner(g, owner)
                 .map(|_| ())
@@ -578,6 +614,8 @@ impl Runtime {
                 execution_owner: None,
                 failure: None,
                 tracking_prefix: true,
+                scope_deferred: false,
+                scope_position: usize::MAX,
             })
         });
         Ok(Handle {
@@ -651,7 +689,7 @@ impl Runtime {
         })
     }
     pub fn get<T: Copy + 'static>(&self, handle: Handle<T>) -> Result<T> {
-        self.read::<T, T, false>(handle, true, |value| *value)
+        self.read_copy(handle, true)
     }
     pub fn get_cloned<T: Clone + 'static>(&self, handle: Handle<T>) -> Result<T> {
         self.read::<T, T, true>(handle, true, Clone::clone)
@@ -660,7 +698,70 @@ impl Runtime {
         self.read::<T, R, true>(handle, true, f)
     }
     pub fn peek<T: Copy + 'static>(&self, handle: Handle<T>) -> Result<T> {
-        self.read::<T, T, false>(handle, false, |value| *value)
+        self.read_copy(handle, false)
+    }
+    fn read_copy<T: Copy + 'static>(&self, handle: Handle<T>, track: bool) -> Result<T> {
+        // Keep the boundary's overflow contract even though the clean path has
+        // no callback and needs no nested notification guard.
+        if self.0.notification_depth.get() == usize::MAX {
+            return self.read::<T, T, false>(handle, track, |v| *v);
+        }
+        if let Err(error) = self.check(READ) {
+            #[cfg(feature = "diagnostics")]
+            self.count(|w| w.reads = w.reads.saturating_add(1));
+            self.notify();
+            return Err(error);
+        }
+        let fast = self.graph(|g| {
+            if handle.runtime != self.0.id {
+                return Err(Error::WrongRuntime);
+            }
+            let h = header(g, handle.key)?;
+            let c = g.cold[handle.key.index as usize]
+                .as_ref()
+                .ok_or(Error::InvalidHandle)?;
+            if c.descriptor.type_id != TypeId::of::<T>() || h.kind == Kind::Effect {
+                return Err(Error::TypeMismatch);
+            }
+            if track && READER_RUNTIME.get().is_some_and(|id| id != self.0.id) {
+                return Err(Error::WrongRuntime);
+            }
+            if h.phase != EvaluationPhase::Idle || h.state != State::Clean || !h.initialized {
+                return Ok(None);
+            }
+            let ptr = c.value.cast::<Typed<T>>();
+            // SAFETY: type, generation, life, kind and initialization were
+            // checked in this kernel. T: Copy runs no user code. No reference
+            // escapes, and tracking Vec growth happens only AFTER the copy.
+            let value = unsafe {
+                let cell = ptr.as_ref();
+                (&*cell.values.get())[cell.current.get()]
+                    .as_ref()
+                    .copied()
+                    .ok_or(Error::UninitializedValue)?
+            };
+            if track && let Some(reader) = self.0.reader.get() {
+                record_read(g, reader, handle.key)?;
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                g.work.reads = g.work.reads.saturating_add(1);
+            }
+            Ok(Some(value))
+        });
+        match fast {
+            Ok(Some(value)) => {
+                self.notify();
+                Ok(value)
+            }
+            Ok(None) => self.read::<T, T, false>(handle, track, |v| *v),
+            Err(error) => {
+                #[cfg(feature = "diagnostics")]
+                self.count(|w| w.reads = w.reads.saturating_add(1));
+                self.notify();
+                Err(error)
+            }
+        }
     }
     fn read<T: 'static, R, const CALLBACK: bool>(
         &self,
@@ -691,38 +792,7 @@ impl Runtime {
         // Resolve again after user code; no pointer acquired before update is reused.
         let ptr = self.resolve(handle)?;
         if track && let Some(reader) = self.0.reader.get() {
-            self.graph(|g| {
-                let revision = header(g, handle.key)?.revision;
-                let freshness = header(g, handle.key)?.freshness;
-                if header(g, reader).is_err() {
-                    return Ok(());
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    g.work.tracked_reads = g.work.tracked_reads.saturating_add(1);
-                }
-                let c = g.cold[reader.index as usize].as_mut().unwrap();
-                let next = c.reads.len();
-                let prefix = c.tracking_prefix
-                    && c.sources
-                        .get(next)
-                        .is_some_and(|s| s.live && s.key == handle.key);
-                if prefix || !c.reads.iter().any(|s| s.key == handle.key) {
-                    // After divergence the old suffix can match an already
-                    // consumed key. Never use it to bypass duplicate checking.
-                    if !prefix {
-                        c.tracking_prefix = false;
-                    }
-                    c.reads.push(Source {
-                        key: handle.key,
-                        revision,
-                        observer_index: 0,
-                        freshness,
-                        live: true,
-                    });
-                }
-                Ok(())
-            })?;
+            self.graph(|g| record_read(g, reader, handle.key))?;
         }
         // SAFETY: resolve proved descriptor and life. The pinned Typed<T>
         // allocation cannot be disposed/mutated during this protected callback;
@@ -798,6 +868,11 @@ impl Runtime {
             let h = header_mut(g, handle.key).unwrap();
             h.revision = revision.0;
             h.freshness = revision.1;
+            #[cfg(feature = "topology-diagnostics")]
+            if self.0.topology_enabled.get() {
+                self.0.topology.borrow_mut().changed(handle.key);
+            }
+            shared_plan::global_changed(self, handle.key);
             mark(g, handle.key)
         });
         let _ = visits;
@@ -812,187 +887,68 @@ impl Runtime {
         Ok(())
     }
     fn update(&self, key: Key) -> Result<()> {
-        self.check(READ)?;
-        let needed = self.graph(|g| {
-            let h = header(g, key)?;
-            if h.phase != EvaluationPhase::Idle {
-                return Err(Error::Cycle);
+        #[cfg(feature = "topology-diagnostics")]
+        let _topology = topology::begin_read(self, key);
+        match self.0.strategy {
+            EvaluationStrategy::FullFrames => evaluation::update(self, key),
+            EvaluationStrategy::LightFrames => planning::update::<false>(self, key),
+            EvaluationStrategy::DemandDriven => planning::update::<true>(self, key),
+            EvaluationStrategy::SharedPlan | EvaluationStrategy::SharedPlanDirty => {
+                shared_plan::update::<false, false, false>(self, key)
             }
-            Ok(h.state != State::Clean || !h.initialized)
-        });
-        let needed = match needed {
-            Ok(n) => n,
-            Err(e) => {
-                #[cfg(feature = "diagnostics")]
-                if e == Error::Cycle {
-                    self.capture_cycle(key);
-                }
-                self.record_failure(e);
-                return Err(e);
+            EvaluationStrategy::SharedPlanOptimized
+            | EvaluationStrategy::SharedPlanDirtyOptimized => {
+                shared_plan::update::<true, false, false>(self, key)
             }
-        };
-        if !needed {
-            return Ok(());
-        }
-        let depth = self.0.depth.get();
-        if depth >= 512 {
-            self.record_failure(Error::Depth);
-            return Err(Error::Depth);
-        }
-        self.graph(|g| {
-            header_mut(g, key).unwrap().phase = EvaluationPhase::Checking;
-        });
-        #[cfg(feature = "diagnostics")]
-        {
-            self.0.diagnostic.borrow_mut().active.push(CycleFrame {
-                node: key.into(),
-                phase: EvaluationPhase::Checking,
-            });
-        }
-        let _evaluation = Evaluation {
-            rt: self,
-            key,
-            reader: self.0.reader.replace(None),
-            depth,
-            owner: self.0.owner.get(),
-        };
-        self.0.depth.set(depth + 1);
-        let kind = self.graph(|g| header(g, key).unwrap().kind);
-        let _caps = if kind == Kind::Effect {
-            Caps::enter(ALL & !FLUSH)
-        } else {
-            Caps::pure(READ)
-        };
-        let _reader_runtime = ReaderRuntime::enter(Some(self.0.id));
-        let result = (|| {
-            let mut cursor = 0;
-            loop {
-                let source = self.graph(|g| {
-                    let h = header(g, key)?;
-                    if h.state == State::Dirty || !h.initialized {
-                        return Ok(None);
-                    }
-                    Ok(g.cold[key.index as usize]
-                        .as_ref()
-                        .unwrap()
-                        .sources
-                        .get(cursor)
-                        .copied())
-                })?;
-                let Some(source) = source else {
-                    break;
-                };
-                #[cfg(feature = "diagnostics")]
-                self.count(|w| w.source_checks = w.source_checks.saturating_add(1));
-                if !source.live {
-                    self.graph(|g| header_mut(g, key).unwrap().state = State::Dirty);
-                    break;
-                }
-                self.graph(|g| {
-                    if header(g, source.key)?.kind == Kind::Effect {
-                        Err(Error::TypeMismatch)
-                    } else {
-                        Ok(())
-                    }
-                })?;
-                self.update(source.key)?;
-                self.check(READ)?;
-                if self.graph(|g| header(g, key).is_err()) {
-                    return Ok(());
-                }
-                let changed = self.graph(|g| {
-                    let revision = header(g, source.key)?.revision;
-                    let h = header_mut(g, key)?;
-                    if revision != source.revision {
-                        h.freshness = h.freshness.checked_add(1).ok_or(Error::Exhausted)?;
-                        h.state = State::Dirty;
-                    }
-                    Ok(revision != source.revision)
-                })?;
-                if changed {
-                    break;
-                }
-                cursor += 1;
+            EvaluationStrategy::GlobalPlan | EvaluationStrategy::GlobalPlanDirty => {
+                shared_plan::update::<true, true, false>(self, key)
             }
-            let execute = self.graph(|g| {
-                let h = header_mut(g, key)?;
-                if h.state != State::Dirty && h.initialized {
-                    h.state = State::Clean;
-                    return Ok(None);
-                }
-                let c = g.cold[key.index as usize].as_mut().unwrap();
-                c.scope_epoch = c.scope_epoch.checked_add(1).ok_or(Error::Exhausted)?;
-                c.reads.clear();
-                c.tracking_prefix = true;
-                Ok(Some((c.value, c.descriptor.execute)))
-            })?;
-            if execute.is_some() {
-                self.set_phase(key, EvaluationPhase::Cleaning);
-                if !self.prepare_execution(key)? {
-                    return Ok(());
-                }
-                self.set_phase(key, EvaluationPhase::Executing);
-                #[cfg(feature = "diagnostics")]
-                self.count(|w| match kind {
-                    Kind::Effect => w.effect_executions = w.effect_executions.saturating_add(1),
-                    _ => w.memo_executions = w.memo_executions.saturating_add(1),
-                });
-                // Cleanup can dispose the node and reuse its slot. Resolve the
-                // descriptor again; never reuse the pointer acquired before it.
-                let (value, execute) = self.graph(|g| {
-                    let c = g.cold[key.index as usize].as_ref().unwrap();
-                    (c.value, c.descriptor.execute)
-                });
-                self.0.reader.set(Some(key));
-                if kind == Kind::Effect {
-                    self.0.executions.set(
-                        self.0
-                            .executions
-                            .get()
-                            .checked_add(1)
-                            .ok_or(Error::Exhausted)?,
-                    );
-                }
-                // SAFETY: descriptor and allocation are installed together.
-                // No graph/value reference is held while invoking user code.
-                unsafe {
-                    execute(value, self, key)?;
-                }
-                if self.graph(|g| header(g, key).is_err()) {
-                    return Ok(());
-                }
-                self.reconcile(key)?;
-                self.graph(|g| {
-                    let h = header_mut(g, key)?;
-                    h.initialized = true;
-                    Ok(())
-                })?;
+            EvaluationStrategy::LocalPlan | EvaluationStrategy::LocalPlanDirty => {
+                shared_plan::update::<true, true, true>(self, key)
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.record_failure(error);
-        }
-        result
-    }
-    fn set_phase(&self, key: Key, phase: EvaluationPhase) {
-        self.graph(|g| {
-            if let Ok(h) = header_mut(g, key) {
-                h.phase = phase;
-            }
-        });
-        #[cfg(feature = "diagnostics")]
-        if let Some(frame) = self.0.diagnostic.borrow_mut().active.last_mut() {
-            frame.phase = phase;
+            EvaluationStrategy::OrderedDemand => ordered::update(self, key),
         }
     }
     fn reconcile(&self, key: Key) -> Result<()> {
-        self.graph(|g| {
+        let result = self.graph(|g| {
             #[cfg(feature = "diagnostics")]
             {
                 g.work.reconciliations = g.work.reconciliations.saturating_add(1);
             }
             header(g, key)?;
+            // Stable reads need no buffer swap, retain, unlink or rebuilding.
+            // First validate ALL sources; only then update committed revisions.
+            // A tombstone, stale source or divergent prefix uses the full path.
+            let c = g.cold[key.index as usize].as_ref().unwrap();
+            let mut state = State::Clean;
+            let stable = c.tracking_prefix
+                && c.sources.len() == c.reads.len()
+                && c.sources.iter().zip(&c.reads).all(|(a, b)| {
+                    if !a.live || a.key != b.key {
+                        return false;
+                    }
+                    let Ok(h) = header(g, b.key) else {
+                        return false;
+                    };
+                    if h.revision != b.revision {
+                        state = State::Dirty;
+                    } else if h.freshness != b.freshness || h.state != State::Clean {
+                        state = state.max(State::Check);
+                    }
+                    true
+                });
+            if stable {
+                let c = g.cold[key.index as usize].as_mut().unwrap();
+                for (old, new) in c.sources.iter_mut().zip(&c.reads) {
+                    old.revision = new.revision;
+                    old.freshness = new.freshness;
+                }
+                c.reads.clear();
+                let h = header_mut(g, key)?;
+                h.state = state;
+                h.initialized = true;
+                return Ok(());
+            }
             // Move reusable buffers out, do not allocate or drop user payloads.
             let c = g.cold[key.index as usize].as_mut().unwrap();
             let mut old = std::mem::take(&mut c.sources);
@@ -1013,6 +969,8 @@ impl Runtime {
             if old.len() != new.len()
                 || old.iter().zip(&new).any(|(a, b)| !a.live || a.key != b.key)
             {
+                shared_plan::local_structure_changed(self, g, key);
+                ordered::structure_changed(self, key, new.len());
                 for source in &old {
                     unlink(g, *source, key);
                 }
@@ -1039,8 +997,22 @@ impl Runtime {
             c.sources = new;
             c.reads = old;
             header_mut(g, key)?.state = state;
+            header_mut(g, key)?.initialized = true;
             Ok(())
-        })
+        });
+        #[cfg(feature = "topology-diagnostics")]
+        if result.is_ok() && self.0.topology_enabled.get() {
+            topology::completed(self, key);
+        }
+        if result.is_ok()
+            && matches!(
+                self.0.strategy,
+                EvaluationStrategy::GlobalPlan | EvaluationStrategy::GlobalPlanDirty
+            )
+        {
+            shared_plan::invalidate_global(self);
+        }
+        result
     }
     pub fn flush(&self) -> Result<usize> {
         let report = self.flush_with(Default::default())?;
@@ -1138,6 +1110,9 @@ impl Runtime {
                 {
                     return Err(Error::Invariant);
                 }
+                if c.scope_deferred && (c.execution_owner.is_some() || c.scope_epoch == 0) {
+                    return Err(Error::Invariant);
+                }
                 if h.queue != 0 && h.kind != Kind::Effect {
                     return Err(Error::Invariant);
                 }
@@ -1198,6 +1173,38 @@ impl Runtime {
             Ok(())
         })
     }
+}
+
+// Callback-free tracking shared by clean Copy reads and the generic slow path.
+// Dedup retains the FIRST revision consumed, including reads after a write.
+fn record_read(g: &mut Graph, reader: Key, source: Key) -> Result<()> {
+    let h = header(g, source)?;
+    let (revision, freshness) = (h.revision, h.freshness);
+    if header(g, reader).is_err() {
+        return Ok(());
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        g.work.tracked_reads = g.work.tracked_reads.saturating_add(1);
+    }
+    let c = g.cold[reader.index as usize].as_mut().unwrap();
+    let prefix = c.tracking_prefix
+        && c.sources
+            .get(c.reads.len())
+            .is_some_and(|s| s.live && s.key == source);
+    if prefix || !c.reads.iter().any(|s| s.key == source) {
+        if !prefix {
+            c.tracking_prefix = false;
+        }
+        c.reads.push(Source {
+            key: source,
+            revision,
+            freshness,
+            observer_index: 0,
+            live: true,
+        });
+    }
+    Ok(())
 }
 
 fn mark(g: &mut Graph, source: Key) -> u64 {
@@ -1273,7 +1280,10 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
     // SAFETY: descriptor is monomorphized for the pinned allocation's T.
     // Take the callback without retaining a cell reference across user code.
     let mut compute = unsafe { (&mut *ptr.as_ref().compute.get()).take().expect("compute") };
-    let mut outcome = catch_unwind(AssertUnwindSafe(|| compute(rt)));
+    let mut outcome = {
+        let _callback = shared_plan::Callback::enter(rt);
+        catch_unwind(AssertUnwindSafe(|| compute(rt)))
+    };
     match &outcome {
         Ok(Err(e)) => rt.record_failure(*e),
         Err(_) => rt.record_failure(Error::Panic),
@@ -1361,6 +1371,21 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
         };
         rt.graph(|g| {
             header_mut(g, key).unwrap().revision = revision;
+            if matches!(
+                rt.0.strategy,
+                EvaluationStrategy::SharedPlanDirty | EvaluationStrategy::SharedPlanDirtyOptimized
+            ) {
+                shared_plan::published(g, key);
+            }
+            if rt.0.strategy == EvaluationStrategy::GlobalPlanDirty {
+                shared_plan::global_published(rt, g, key);
+            }
+            if rt.0.strategy == EvaluationStrategy::OrderedDemand {
+                shared_plan::published(g, key);
+            }
+            if rt.0.strategy == EvaluationStrategy::LocalPlanDirty {
+                shared_plan::local_published(rt, g, key);
+            }
         });
         rt.retire(old);
     }

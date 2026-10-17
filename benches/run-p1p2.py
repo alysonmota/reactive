@@ -53,11 +53,13 @@ def main():
     p.add_argument("--mode", choices=["pilot", "full", "sham", "memory", "work", "baseline", "matrix"], default="pilot")
     p.add_argument("--cpu", type=int, default=2)
     p.add_argument("--contracts", action="store_true",help="Include owner-resource and writable-effect fixtures")
+    p.add_argument('--evaluation', choices=['full','light','topological','shared','shared-dirty','shared-opt','shared-dirty-opt','global','global-dirty','local','local-dirty','ordered'], default='full')
     args = p.parse_args()
     assert args.label and all(c.isalnum() or c in "-_" for c in args.label)
     root = LOG / "runs" / args.label
     root.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, CARGO_TARGET_DIR="/tmp/opencode/reactive-p1p2-lab-target", REACTIVE_TYPED_PROTOTYPE="1")
+    env['TYPED_EVALUATION']=args.evaluation
     package_root = ROOT
     if args.mode == "baseline":
         package_root = Path(json.loads((LOG / "p1p2-baseline.json").read_text())["directory"])
@@ -80,7 +82,7 @@ def main():
                 "cpu": args.cpu, "system": platform.uname()._asdict(),
                 "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
                 "cargo_home": os.environ.get("CARGO_HOME"), "runs": [],
-                "contracts":args.contracts,"driver_source":Path(__file__).read_text(),
+                 "contracts":args.contracts,"evaluation":args.evaluation,"driver_source":Path(__file__).read_text(),
                 "limitations": "Research core with reintegrated owners/cleanups, writable effects, rounds/budgets, batching and hooks; not full public API conformance"}
     destination = LOG / f"{args.label}.json"
     destination.write_text(json.dumps(metadata, indent=2) + "\n")

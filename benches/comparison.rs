@@ -121,7 +121,7 @@ impl Engine for Typed {
     type Signal = typed_runtime_prototype::Handle<u64>;
     type Memo = typed_runtime_prototype::Handle<u64>;
     fn new() -> Self {
-        let runtime = typed_runtime_prototype::Runtime::new();
+        let runtime = contracts::evaluation_strategy::runtime();
         let owner = Some(runtime.create_root().unwrap());
         Self { runtime, owner }
     }

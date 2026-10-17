@@ -216,13 +216,15 @@ impl Backend for Local {
 }
 #[derive(Clone)]
 struct Typed(typed_runtime_prototype::Runtime);
+#[path = "evaluation.rs"]
+pub(super) mod evaluation_strategy;
 impl Backend for Typed {
     const NAME: &'static str = "typed_research";
     type Owner = typed_runtime_prototype::OwnerHandle;
     type Value = typed_runtime_prototype::Handle<u64>;
     type Effect = typed_runtime_prototype::Handle<()>;
     fn new() -> Self {
-        Self(typed_runtime_prototype::Runtime::new())
+        Self(evaluation_strategy::runtime())
     }
     fn root(&self) -> Self::Owner {
         self.0.create_root().unwrap()

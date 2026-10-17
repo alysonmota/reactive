@@ -90,7 +90,7 @@ pub struct GraphSnapshot {
     pub nodes: Vec<NodeSnapshot>,
 }
 impl Runtime {
-    fn check_observation(&self) -> Result<()> {
+    pub(super) fn check_observation(&self) -> Result<()> {
         if self.0.depth.get() != 0 || self.0.disposal.get() != 0 {
             return Err(Error::Reentrancy);
         }
@@ -112,11 +112,21 @@ impl Runtime {
                     + ownership::capacity_bytes(g),
                 queue_capacity_bytes: (g.pending.capacity() + g.current.capacity())
                     * std::mem::size_of::<Key>(),
-                scratch_capacity_bytes: g.marks.capacity() * std::mem::size_of::<(Key, State)>(),
+                scratch_capacity_bytes: g.marks.capacity() * std::mem::size_of::<(Key, State)>()
+                    + self.0.frames.borrow().capacity() * std::mem::size_of::<evaluation::Frame>()
+                    + self.0.validation_frames.borrow().capacity()
+                        * std::mem::size_of::<planning::Frame>()
+                    + self.0.shared_frames.borrow().capacity()
+                        * std::mem::size_of::<shared_plan::Frame>()
+                    + self.0.shared_plan.borrow().capacity_bytes(),
                 node_size: std::mem::size_of::<Hot>() + std::mem::size_of::<Cold>(),
                 metadata_size: std::mem::size_of::<Hot>(),
                 ..Default::default()
             };
+            #[cfg(feature = "topology-diagnostics")]
+            {
+                metrics.scratch_capacity_bytes += self.0.topology.borrow().capacity_bytes();
+            }
             let mut nodes = 0;
             let mut edges = 0;
             for c in g.cold.iter().flatten() {
@@ -149,6 +159,22 @@ impl Runtime {
     pub fn graph_snapshot(&self) -> Result<GraphSnapshot> {
         self.check_observation()?;
         self.graph(|g| {
+            // Requesting owner identities is an observation of those scopes.
+            // Materialize without evaluating callbacks or inspecting values.
+            for i in 0..g.cold.len() {
+                if let Some(c) = g.cold[i].as_ref()
+                    && c.scope_deferred
+                {
+                    let pending = ownership::PendingOwner {
+                        node: Key {
+                            index: i as u32,
+                            generation: g.hot[i].generation,
+                        },
+                        epoch: c.scope_epoch,
+                    };
+                    ownership::materialize(g, pending)?;
+                }
+            }
             Ok(GraphSnapshot {
                 runtime_identity: self.0.id,
                 nodes: g
