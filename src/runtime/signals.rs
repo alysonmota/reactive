@@ -28,10 +28,17 @@ struct WriteInputs<T, F = ()> {
     callback: Option<F>,
     previous: Option<Rc<RefCell<Option<T>>>>,
     comparator: Option<Comparator>,
+    /// Default `PartialEq` fast path captured with the node (no downcasts).
+    fast_equals: Option<&'static crate::node::EqualsDescriptor>,
     retired: Option<T>,
 }
 
-type CapturedSignal<T> = (Rc<RefCell<Option<T>>>, Comparator, u64);
+type CapturedSignal<T> = (
+    Rc<RefCell<Option<T>>>,
+    Comparator,
+    Option<&'static crate::node::EqualsDescriptor>,
+    u64,
+);
 
 impl<T: 'static, F> WriteInputs<T, F> {
     fn release(self, runtime: &Runtime) -> Option<PanicPayload> {
@@ -49,7 +56,28 @@ impl Runtime {
     /// Creates a signal in the current explicit owner, using `PartialEq`.
     /// Values need not implement Clone. NaN follows standard float PartialEq.
     pub fn signal<T: PartialEq + 'static>(&self, initial: T) -> Result<Signal<T>, RuntimeError> {
-        self.signal_with(initial, T::eq)
+        self.resource_boundary(
+            NewSignal::<T, fn(&T, &T) -> bool> {
+                value: Some(initial),
+                comparator: None,
+            },
+            |inputs| {
+                // Reject invalid creation before allocating graph snapshots.
+                self.check(Operation::Create)?;
+                let owner = self
+                    .inner
+                    .context
+                    .snapshot()
+                    .owner
+                    .ok_or(RuntimeError::MissingOwner)?;
+                if self.inner.storage.borrow().owners.get(owner).is_none() {
+                    return Err(RuntimeError::OwnerDisposed);
+                }
+                let payload = Payload::signal_default(inputs.value.take().expect("initial value"));
+                self.insert_node(payload).map(Signal::new)
+            },
+            |inputs| inputs.release(self),
+        )
     }
 
     /// Creates a signal with a pure, untracked comparator over immutable values.
@@ -166,7 +194,12 @@ impl Runtime {
         let Payload::Signal(data) = &node.payload else {
             unreachable!("validated signal kind")
         };
-        Ok((previous, data.equals.clone(), node.metadata.value_revision))
+        Ok((
+            previous,
+            data.equals.clone(),
+            data.fast_equals,
+            node.metadata.value_revision,
+        ))
     }
 
     pub(crate) fn write_signal<T: 'static>(
@@ -180,12 +213,14 @@ impl Runtime {
                 callback: None,
                 previous: None,
                 comparator: None,
+                fast_equals: None,
                 retired: None,
             },
             |inputs| {
-                let (previous, comparator, revision) = self.capture_signal::<T>(id)?;
+                let (previous, comparator, fast_equals, revision) = self.capture_signal::<T>(id)?;
                 inputs.previous = Some(previous);
                 inputs.comparator = Some(comparator);
+                inputs.fast_equals = fast_equals;
                 self.commit_signal(id, revision, inputs)
             },
             |inputs| inputs.release(self),
@@ -203,12 +238,14 @@ impl Runtime {
                 callback: Some(callback),
                 previous: None,
                 comparator: None,
+                fast_equals: None,
                 retired: None,
             },
             |inputs| {
-                let (previous, comparator, revision) = self.capture_signal::<T>(id)?;
+                let (previous, comparator, fast_equals, revision) = self.capture_signal::<T>(id)?;
                 inputs.previous = Some(previous);
                 inputs.comparator = Some(comparator);
+                inputs.fast_equals = fast_equals;
                 {
                     let _capabilities = CapabilityGuard::enter(CallbackKind::BorrowedRead);
                     let previous = inputs.previous.as_ref().expect("previous value").borrow();
@@ -252,61 +289,115 @@ impl Runtime {
         revision: u64,
         inputs: &mut WriteInputs<T, F>,
     ) -> Result<(), RuntimeError> {
+        // Hot path contract: when the node carries a monomorphic equality
+        // descriptor (`fast_equals`), validation, comparison and the commit
+        // happen inside ONE storage pass — no duplicated borrow round-trips
+        // and no second check/check_identity trip after the comparison. The
+        // comparison runs no user code (plain `T::eq` on already-typed
+        // references), so captured state stays valid across the whole window.
+        // Custom comparators still run without any storage borrow held, and
+        // the post-comparison revalidation (check/check_identity/revision)
+        // is preserved exactly as before, because user code may have written
+        // the signal in the meantime.
+        let candidate = inputs.candidate.as_ref().expect("candidate value");
+        let mut storage = self.inner.storage.borrow_mut();
+        // One-pass fast path: monomorphic equality, no user code executed
+        // while the storage borrow is held, so captured state stays valid.
         let equal = {
-            let _context = self.inner.context.enter(|snapshot| snapshot.reader = None);
-            let _reader_runtime = ReaderRuntimeGuard::enter(None);
-            let _capabilities = CapabilityGuard::enter(CallbackKind::Comparator);
-            let previous = inputs
-                .previous
-                .as_ref()
-                .expect("previous snapshot")
-                .as_ref();
-            let candidate = inputs.candidate.as_ref().expect("candidate value");
-            inputs.comparator.as_ref().expect("signal comparator")(
-                previous as &dyn Any,
-                candidate as &dyn Any,
-            )?
-        };
-        self.check(Operation::Write)?;
-        self.check_identity(id)?;
-        let result = {
-            let mut storage = self.inner.storage.borrow_mut();
             let node = storage
                 .nodes
-                .get_mut(id.slot)
+                .get(id.slot)
                 .ok_or(RuntimeError::InvalidHandle)?;
             node.validate_type::<T>(NodeKind::Signal)?;
             if node.metadata.value_revision != revision {
+                self.record_failure(RuntimeError::UpdateConflict);
                 return Err(RuntimeError::UpdateConflict);
             }
-            if equal {
-                // No candidate Rc allocation, marking or revision change.
-                return Ok(());
-            }
-            let Some(value_revision) = node.metadata.value_revision.checked_add(1) else {
-                drop(storage);
-                self.record_failure(RuntimeError::CounterExhausted);
-                return Err(RuntimeError::CounterExhausted);
-            };
-            let Some(freshness_revision) = node.metadata.freshness_revision.checked_add(1) else {
-                drop(storage);
-                self.record_failure(RuntimeError::CounterExhausted);
-                return Err(RuntimeError::CounterExhausted);
-            };
-            let Payload::Signal(data) = &mut node.payload else {
+            let Payload::Signal(data) = &node.payload else {
                 unreachable!("validated signal kind")
             };
-            let cell = data
-                .value
-                .downcast_ref::<RefCell<Option<T>>>()
-                .expect("validated cell");
-            inputs.retired = cell
-                .borrow_mut()
-                .replace(inputs.candidate.take().expect("candidate value"));
-            node.metadata.value_revision = value_revision;
-            node.metadata.freshness_revision = freshness_revision;
-            Self::invalidate_signal_observers(&mut storage, id.slot)
+            match data.fast_equals {
+                Some(descriptor) => {
+                    // Typed borrow of the captured cell: zero downcasts in the
+                    // comparison window; `as &dyn Any` re-erases at no cost.
+                    let previous = inputs
+                        .previous
+                        .as_ref()
+                        .expect("previous snapshot")
+                        .try_borrow()
+                        .map_err(|_| RuntimeError::Reentrancy)?;
+                    let current = previous.as_ref().ok_or(RuntimeError::UninitializedValue)?;
+                    (descriptor.equals)(current as &dyn Any, candidate as &dyn Any)
+                }
+                None => {
+                    // Custom comparator: never hold a graph borrow while user
+                    // code executes. Drop the borrow, compare, revalidate below.
+                    let comparator = data.equals.clone();
+                    let previous = inputs
+                        .previous
+                        .as_ref()
+                        .expect("previous snapshot")
+                        .clone();
+                    drop(storage);
+                    let _context = self
+                        .inner
+                        .context
+                        .enter(|snapshot| snapshot.reader = None);
+                    let _reader_runtime = ReaderRuntimeGuard::enter(None);
+                    let _capabilities = CapabilityGuard::enter(CallbackKind::Comparator);
+                    let outcome = comparator(previous.as_ref() as &dyn Any, candidate as &dyn Any);
+                    self.check(Operation::Write)?;
+                    self.check_identity(id)?;
+                    storage = self.inner.storage.borrow_mut();
+                    if outcome? {
+                        return Ok(());
+                    }
+                    false
+                }
+            }
         };
+        if equal {
+            // No candidate Rc allocation, marking or revision change.
+            return Ok(());
+        }
+        // Values differ (or the custom comparator path completed). Re-validate
+        // identity/revision after any potential re-entry, then commit.
+        let node = storage
+            .nodes
+            .get_mut(id.slot)
+            .ok_or(RuntimeError::InvalidHandle)?;
+        node.validate_type::<T>(NodeKind::Signal)?;
+        if node.metadata.value_revision != revision {
+            self.record_failure(RuntimeError::UpdateConflict);
+            return Err(RuntimeError::UpdateConflict);
+        }
+        let value_revision = node.metadata.value_revision.checked_add(1);
+        let freshness_revision = node.metadata.freshness_revision.checked_add(1);
+        let Some(value_revision) = value_revision else {
+            self.record_failure(RuntimeError::CounterExhausted);
+            return Err(RuntimeError::CounterExhausted);
+        };
+        let Some(freshness_revision) = freshness_revision else {
+            self.record_failure(RuntimeError::CounterExhausted);
+            return Err(RuntimeError::CounterExhausted);
+        };
+        let Payload::Signal(data) = &mut node.payload else {
+            unreachable!("validated signal kind")
+        };
+        let cell = data
+            .value
+            .downcast_ref::<RefCell<Option<T>>>()
+            .expect("validated cell");
+        inputs.retired = cell
+            .borrow_mut()
+            .replace(inputs.candidate.take().expect("candidate value"));
+        node.metadata.value_revision = value_revision;
+        node.metadata.freshness_revision = freshness_revision;
+        // Marking runs with the storage borrow held but no user code: any
+        // reentrant write to this signal fails with a recoverable error
+        // instead of a double-borrow panic (original guarded behaviour).
+        let result = Self::invalidate_signal_observers(&mut storage, id.slot);
+        drop(storage);
         if let Err(error) = &result {
             self.record_failure(error.clone());
         }
@@ -354,6 +445,7 @@ mod tests {
                 value: Some(Rc::new(RefCell::new(Some(0_u32)))),
                 compute: Some(Box::new(|_, _| panic!("set must not run a memo"))),
                 equals: Payload::comparator::<u32>(u32::eq),
+                        fast_equals: None,
             },
             NodeKind::Effect => Payload::effect(Box::new(|_| panic!("set must not run an effect"))),
             NodeKind::Signal => unreachable!(),

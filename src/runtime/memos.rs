@@ -11,7 +11,16 @@ use crate::{
 
 struct NewMemo<F, C> {
     compute: Option<F>,
-    comparator: Option<C>,
+    equals: Option<C>,
+}
+
+impl<F> NewMemo<F, Comparator> {
+    fn dynamic(compute: F, equals: Option<Comparator>) -> Self {
+        Self {
+            compute: Some(compute),
+            equals,
+        }
+    }
 }
 
 struct Execution {
@@ -19,6 +28,8 @@ struct Execution {
     value_type: &'static ValueType,
     compute: Option<MemoCompute>,
     comparator: Option<Comparator>,
+    /// Default `PartialEq` fast path mirrored from the node payload.
+    fast_equals: Option<&'static crate::node::EqualsDescriptor>,
     previous: Option<Value>,
     candidate: Option<Value>,
 }
@@ -57,7 +68,7 @@ impl Execution {
             let failure = runtime.first_failure();
             if let Some(node) = runtime.inner.storage.borrow_mut().nodes.get_mut(self.id) {
                 node.metadata.state = State::Dirty;
-                node.metadata.failure = failure;
+                node.metadata.set_failure(failure);
                 node.reads.clear();
             }
         }
@@ -72,20 +83,28 @@ impl Runtime {
         &self,
         compute: impl FnMut(&Runtime) -> Result<T, RuntimeError> + 'static,
     ) -> Result<Memo<T>, RuntimeError> {
-        self.memo_with(compute, T::eq)
+        self.memo_erased(
+            compute,
+            None::<fn(&T, &T) -> bool>,
+            Some(&const { crate::node::EqualsDescriptor::of::<T>() }),
+        )
     }
 
     /// A lazy memo with an explicit pure equality policy. Equal results retain
     /// the previous value slot but still reconcile dynamic dependencies.
-    pub fn memo_with<T: 'static>(
+    fn memo_erased<T: 'static>(
         &self,
         compute: impl FnMut(&Runtime) -> Result<T, RuntimeError> + 'static,
-        comparator: impl Fn(&T, &T) -> bool + 'static,
-    ) -> Result<Memo<T>, RuntimeError> {
+        comparator: Option<impl Fn(&T, &T) -> bool + 'static>,
+        fast_equals: Option<&'static crate::node::EqualsDescriptor>,
+    ) -> Result<Memo<T>, RuntimeError>
+    where
+        T: PartialEq,
+    {
         self.resource_boundary(
             NewMemo {
                 compute: Some(compute),
-                comparator: Some(comparator),
+                equals: comparator,
             },
             |inputs| {
                 self.check(Operation::Create)?;
@@ -105,6 +124,10 @@ impl Runtime {
                     Rc::new(RefCell::new(None::<T>)),
                     Rc::new(RefCell::new(None::<T>)),
                 ];
+                let equals = match inputs.equals.take() {
+                    Some(comparator) => Payload::comparator(comparator),
+                    None => Rc::new(crate::node::default_equals::<T>),
+                };
                 self.insert_node(Payload::Memo {
                     value_type: &const { ValueType::of::<T>() },
                     value: None,
@@ -119,14 +142,80 @@ impl Runtime {
                         *cell.borrow_mut() = Some(candidate);
                         Ok(slots[index].clone())
                     })),
-                    equals: Payload::comparator(inputs.comparator.take().expect("comparator")),
+                    equals,
+                    fast_equals,
                 })
                 .map(Memo::new)
             },
             |inputs| {
                 let mut first = None;
                 self.merge_panic(&mut first, self.release_one(inputs.compute));
-                self.merge_panic(&mut first, self.release_one(inputs.comparator));
+                self.merge_panic(&mut first, self.release_one(inputs.equals));
+                first
+            },
+        )
+    }
+
+    pub fn memo_with<T: 'static>(
+        &self,
+        compute: impl FnMut(&Runtime) -> Result<T, RuntimeError> + 'static,
+        comparator: impl Fn(&T, &T) -> bool + 'static,
+    ) -> Result<Memo<T>, RuntimeError> {
+        self.memo_erased_dynamic(compute, Some(Payload::comparator(comparator)))
+    }
+
+    /// Dynamic-comparator path (no `T: PartialEq` requirement). The default
+    /// `memo` entry point bypasses this and stores a monomorphic descriptor.
+    fn memo_erased_dynamic<T: 'static>(
+        &self,
+        compute: impl FnMut(&Runtime) -> Result<T, RuntimeError> + 'static,
+        equals: Option<Comparator>,
+    ) -> Result<Memo<T>, RuntimeError> {
+        let fast_equals: Option<&'static crate::node::EqualsDescriptor> = None;
+        self.resource_boundary(
+            NewMemo::dynamic(compute, equals),
+            |inputs| {
+                self.check(Operation::Create)?;
+                let owner = self
+                    .inner
+                    .context
+                    .snapshot()
+                    .owner
+                    .ok_or(RuntimeError::MissingOwner)?;
+                if self.inner.storage.borrow().owners.get(owner).is_none() {
+                    return Err(RuntimeError::OwnerDisposed);
+                }
+                let mut compute = inputs.compute.take().expect("compute");
+                // Two reusable typed slots: current and provisional candidate.
+                // No per-evaluation Rc allocation, and no T crosses erasure by value.
+                let slots: [Value; 2] = [
+                    Rc::new(RefCell::new(None::<T>)),
+                    Rc::new(RefCell::new(None::<T>)),
+                ];
+                let equals = inputs.equals.take().expect("validated comparator");
+                self.insert_node(Payload::Memo {
+                    value_type: &const { ValueType::of::<T>() },
+                    value: None,
+                    compute: Some(Box::new(move |runtime, previous| {
+                        let index =
+                            usize::from(previous.is_some_and(|value| Rc::ptr_eq(value, &slots[0])));
+                        let candidate = compute(runtime)?;
+                        let cell = slots[index]
+                            .downcast_ref::<RefCell<Option<T>>>()
+                            .expect("typed candidate slot");
+                        debug_assert!(cell.borrow().is_none());
+                        *cell.borrow_mut() = Some(candidate);
+                        Ok(slots[index].clone())
+                    })),
+                    equals,
+                    fast_equals,
+                })
+                .map(Memo::new)
+            },
+            |inputs| {
+                let mut first = None;
+                self.merge_panic(&mut first, self.release_one(inputs.compute));
+                self.merge_panic(&mut first, self.release_shared(inputs.equals));
                 first
             },
         )
@@ -281,7 +370,7 @@ impl Runtime {
         self.record_failure(error.clone());
         if let Some(node) = self.inner.storage.borrow_mut().nodes.get_mut(id) {
             node.metadata.state = State::Dirty;
-            node.metadata.failure = Some(Rc::new(error));
+            node.metadata.set_failure(Some(Rc::new(error)));
         }
     }
 
@@ -399,7 +488,7 @@ impl Runtime {
                 value,
                 compute,
                 equals,
-                ..
+                fast_equals,
             } = &mut node.payload
             else {
                 unreachable!()
@@ -416,6 +505,7 @@ impl Runtime {
                 // to execution resources until commit or failure restoration.
                 previous: value.take(),
                 comparator: Some(equals.clone()),
+                fast_equals: *fast_equals,
                 candidate: None,
             }
         };
@@ -470,10 +560,19 @@ impl Runtime {
             let _context = self.inner.context.enter(|snapshot| snapshot.reader = None);
             let _reader_runtime = ReaderRuntimeGuard::enter(None);
             let _capabilities = CapabilityGuard::enter(CallbackKind::Comparator);
-            !inputs.comparator.as_ref().expect("comparator")(
-                previous.as_ref(),
-                inputs.candidate.as_ref().expect("candidate").as_ref(),
-            )?
+            // Fast path: monomorphic default equality, no vtable call or extra
+            // downcast chain. Custom comparators keep the dynamic closure.
+            let equals = match inputs.fast_equals {
+                Some(descriptor) => (descriptor.cell_equals)(
+                    previous.as_ref(),
+                    inputs.candidate.as_ref().expect("candidate").as_ref(),
+                )?,
+                None => inputs.comparator.as_ref().expect("comparator")(
+                    previous.as_ref(),
+                    inputs.candidate.as_ref().expect("candidate").as_ref(),
+                )?,
+            };
+            !equals
         } else {
             true
         };
@@ -1958,7 +2057,7 @@ mod tests {
             (
                 node.sources.as_ptr(),
                 node.reads.as_ptr(),
-                node.tracking.seen_sources.capacity(),
+                node.tracking.seen_capacity(),
             )
         };
         let initial = allocations();

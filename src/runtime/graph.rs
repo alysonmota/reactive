@@ -8,7 +8,7 @@ use crate::{
 // Calibrated with stable/reordered/duplicate/nested fan-in sweeps at 16/32/64/128.
 // Small sets stay linear; larger sets keep bounded hash lookup costs. See
 // benches/.log/RESULTS.md (not a universal hardware-independent crossover).
-const HASH_THRESHOLD: usize = 128;
+pub(crate) const HASH_THRESHOLD: usize = 128;
 
 impl Runtime {
     pub(super) fn start_tracking(
@@ -28,7 +28,7 @@ impl Runtime {
         node.tracking.execution_epoch = epoch;
         node.tracking.stable_prefix_cursor = 0;
         node.tracking.diverged = false;
-        node.tracking.seen_sources.clear();
+        node.tracking.seen_clear();
         node.tracking.hashing = node.sources.len() > HASH_THRESHOLD;
         storage.tracking_stack.push(reader);
         Ok(())
@@ -64,11 +64,10 @@ impl Runtime {
             // Fast-prefix reads deliberately skip hashing. The set covers the
             // first len() unique records: catch up only the unseeded suffix on
             // fallback, including after duplicates followed by more fast reads.
-            let seeded = node.tracking.seen_sources.len();
+            let seeded = node.tracking.seen_len();
             node.tracking
-                .seen_sources
-                .extend(node.reads[seeded..].iter().map(|read| read.source));
-            if !node.tracking.seen_sources.insert(read.source) {
+                .seen_extend(node.reads[seeded..].iter().map(|read| read.source));
+            if !node.tracking.seen_insert(read.source) {
                 return;
             }
         } else {
@@ -77,9 +76,8 @@ impl Runtime {
             }
             if node.reads.len() >= HASH_THRESHOLD {
                 node.tracking
-                    .seen_sources
-                    .extend(node.reads.iter().map(|read| read.source));
-                node.tracking.seen_sources.insert(read.source);
+                    .seen_extend(node.reads.iter().map(|read| read.source));
+                node.tracking.seen_insert(read.source);
                 node.tracking.hashing = true;
             }
         }
@@ -212,18 +210,77 @@ impl Runtime {
         storage: &mut Storage,
         source: SlotId,
     ) -> Result<(), RuntimeError> {
-        storage.mark_stack.clear();
-        if let Some(source) = storage.nodes.get(source) {
-            storage.mark_stack.extend(
-                source
-                    .observers
-                    .iter()
-                    .map(|edge| (edge.reader, State::Dirty)),
-            );
+        // First-level inline fast path: the overwhelmingly common topology is
+        // a handful of observers reached directly from the written signal.
+        // Mark them without pushing/popping the shared mark stack; only when a
+        // first-level node transitions from Clean do we enqueue its Check
+        // successors for the transitive drain loop. Semantics are identical to
+        // the original push-all-then-drain: `changed` for requested=Dirty is
+        // exactly `state != Dirty`, and the stack was empty on entry.
+        let Some(observers) = storage.nodes.get(source).map(|node| &node.observers) else {
+            return Ok(());
+        };
+        let mut propagated = false;
+        for index in 0..observers.len() {
+            let reader = observers[index].reader;
+            #[cfg(feature = "diagnostics")]
+            {
+                storage.diagnostics.counters.mark_visits =
+                    storage.diagnostics.counters.mark_visits.saturating_add(1);
+            }
+            let Some(node) = storage.nodes.get_mut(reader) else {
+                continue;
+            };
+            if node.payload.kind() == NodeKind::Signal {
+                return Err(RuntimeError::InvariantViolation(
+                    "signal cannot have sources",
+                ));
+            }
+            let executing = node.metadata.phase == EvaluationPhase::Executing;
+            let changed = node.metadata.state != State::Dirty;
+            if executing {
+                node.metadata.invalidation_revision = node
+                    .metadata
+                    .invalidation_revision
+                    .checked_add(1)
+                    .ok_or(RuntimeError::CounterExhausted)?;
+            }
+            if node.payload.kind() == NodeKind::Memo && (changed || executing) {
+                node.metadata.freshness_revision = node
+                    .metadata
+                    .freshness_revision
+                    .checked_add(1)
+                    .ok_or(RuntimeError::CounterExhausted)?;
+            }
+            if node.payload.kind() == NodeKind::Effect {
+                Self::enqueue_effect(storage, reader)?;
+            }
+            let node = storage.nodes.get_mut(reader).expect("live marked node");
+            if !changed {
+                continue;
+            }
+            let was_clean = node.metadata.state == State::Clean;
+            node.metadata.state = State::Dirty;
+            #[cfg(feature = "diagnostics")]
+            {
+                storage.diagnostics.counters.state_changes =
+                    storage.diagnostics.counters.state_changes.saturating_add(1);
+            }
+            if was_clean {
+                storage.mark_stack.extend(
+                    node.observers
+                        .iter()
+                        .map(|edge| (edge.reader, State::Check)),
+                );
+                propagated = true;
+            }
         }
-        let result = Self::drain_marks(storage);
-        storage.mark_stack.clear();
-        result
+        if propagated {
+            let result = Self::drain_marks(storage);
+            storage.mark_stack.clear();
+            return result;
+        }
+        Ok(())
     }
 
     fn mark_node(storage: &mut Storage, id: SlotId, state: State) -> Result<(), RuntimeError> {
@@ -406,7 +463,7 @@ mod tests {
             assert_eq!(node.reads.len(), width);
             assert_eq!(node.tracking.stable_prefix_cursor, width);
             assert!(!node.tracking.diverged);
-            assert!(node.tracking.seen_sources.is_empty());
+            assert!(node.tracking.seen_is_empty());
             drop(storage);
             finish_tracking(&rt, reader);
         }
@@ -431,17 +488,17 @@ mod tests {
         );
         let node = storage.nodes.get(reader).unwrap();
         assert_eq!(node.reads[0], first);
-        assert_eq!(node.tracking.seen_sources.len(), 128);
+        assert_eq!(node.tracking.seen_len(), 128);
         assert!(!node.tracking.diverged);
         for &source in &sources[128..] {
             record(&mut storage, reader, source);
         }
         let node = storage.nodes.get(reader).unwrap();
-        assert_eq!(node.tracking.seen_sources.len(), 128); // suffix still unhashed
+        assert_eq!(node.tracking.seen_len(), 128); // suffix still unhashed
         assert_eq!(node.reads.len(), 256);
         record(&mut storage, reader, sources[255]);
         let node = storage.nodes.get(reader).unwrap();
-        assert_eq!(node.tracking.seen_sources.len(), 256);
+        assert_eq!(node.tracking.seen_len(), 256);
         assert_eq!(node.reads.len(), 256);
         assert_eq!(node.tracking.stable_prefix_cursor, 256);
         assert!(!node.tracking.diverged);
@@ -503,7 +560,7 @@ mod tests {
         assert!(node.tracking.hashing);
         assert!(node.tracking.diverged);
         assert_eq!(node.reads.len(), HASH_THRESHOLD + 1);
-        assert_eq!(node.tracking.seen_sources.len(), HASH_THRESHOLD + 1);
+        assert_eq!(node.tracking.seen_len(), HASH_THRESHOLD + 1);
         drop(storage);
         finish_tracking(&rt, reader);
     }

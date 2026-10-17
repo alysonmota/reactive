@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::{Runtime, RuntimeError, arena::SlotId};
+use crate::runtime::graph::HASH_THRESHOLD;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,6 +51,73 @@ pub(crate) type MemoCompute =
 pub(crate) type EffectCallback = Box<dyn FnMut(&Runtime) -> Result<(), RuntimeError>>;
 pub(crate) type Comparator = Rc<dyn Fn(&dyn Any, &dyn Any) -> Result<bool, RuntimeError>>;
 
+/// Monomorphic equality descriptor shared by every signal/memo of one value
+/// type. The default `PartialEq` path uses it directly (zero downcasts, zero
+/// vtable calls beyond the thin `fn` pointer). Custom user comparators keep
+/// the dynamic [`Comparator`] closure as fallback.
+pub(crate) struct EqualsDescriptor {
+    pub(crate) id: TypeId,
+    pub(crate) cell_equals: fn(&dyn Any, &dyn Any) -> Result<bool, RuntimeError>,
+    /// Bare-vs-bare monomorphic equality for the signal write hot path. The
+    /// caller passes erased references that are known (by construction) to be
+    /// `&T`; no downcast happens inside the storage-borrow window.
+    pub(crate) equals: fn(&dyn Any, &dyn Any) -> bool,
+}
+
+fn bare_equals<T: PartialEq + 'static>(left: &dyn Any, right: &dyn Any) -> bool {
+    let left = left.downcast_ref::<T>().expect("validated value type");
+    let right = right.downcast_ref::<T>().expect("validated value type");
+    T::eq(left, right)
+}
+
+impl EqualsDescriptor {
+    pub(crate) const fn of<T: PartialEq + 'static>() -> Self {
+        Self {
+            id: TypeId::of::<T>(),
+            cell_equals: default_equals::<T>,
+            equals: bare_equals::<T>,
+        }
+    }
+}
+
+fn equals_value<T: PartialEq + 'static>(
+    cell: &dyn Any,
+    candidate: &dyn Any,
+) -> Result<bool, RuntimeError> {
+    let cell = cell
+        .downcast_ref::<RefCell<Option<T>>>()
+        .ok_or(RuntimeError::TypeMismatch)?;
+    let borrowed = cell.try_borrow().map_err(|_| RuntimeError::Reentrancy)?;
+    let candidate = candidate
+        .downcast_ref::<T>()
+        .ok_or(RuntimeError::TypeMismatch)?;
+    Ok(T::eq(
+        borrowed.as_ref().ok_or(RuntimeError::UninitializedValue)?,
+        candidate,
+    ))
+}
+
+/// Shared default `PartialEq` comparator body: cell-vs-cell first, then
+/// cell-vs-bare-value (the update path's working copy).
+pub(crate) fn default_equals<T: PartialEq + 'static>(
+    left: &dyn Any,
+    right: &dyn Any,
+) -> Result<bool, RuntimeError> {
+    if let Some(right_cell) = right.downcast_ref::<RefCell<Option<T>>>() {
+        // Cell-vs-cell: single combined borrow guard.
+        let left_cell = left
+            .downcast_ref::<RefCell<Option<T>>>()
+            .ok_or(RuntimeError::TypeMismatch)?;
+        let left = left_cell.try_borrow().map_err(|_| RuntimeError::Reentrancy)?;
+        let right = right_cell.try_borrow().map_err(|_| RuntimeError::Reentrancy)?;
+        return Ok(T::eq(
+            left.as_ref().ok_or(RuntimeError::UninitializedValue)?,
+            right.as_ref().ok_or(RuntimeError::UninitializedValue)?,
+        ));
+    }
+    equals_value::<T>(left, right)
+}
+
 /// Immutable per-T cell descriptor shared by all instances of that type.
 /// Typed extraction ends the cell borrow before guarded resource release.
 pub(crate) struct ValueType {
@@ -73,6 +141,8 @@ pub(crate) struct SignalData {
     pub(crate) value: Value,
     pub(crate) value_type: &'static ValueType,
     pub(crate) equals: Comparator,
+    /// Default `PartialEq` fast path; `None` when a custom comparator is set.
+    pub(crate) fast_equals: Option<&'static EqualsDescriptor>,
 }
 
 /// First-read revisions are provisional until the reader reconciles its edges.
@@ -104,7 +174,6 @@ pub(crate) struct ObserverEdge {
 }
 
 /// Each reader owns its reusable buffers; the runtime stacks active reader IDs.
-#[derive(Default)]
 pub(crate) struct TrackingContext {
     pub(crate) execution_epoch: u64,
     pub(crate) stable_prefix_cursor: usize,
@@ -112,7 +181,70 @@ pub(crate) struct TrackingContext {
     pub(crate) hashing: bool,
     // When hashing, covers the first len() unique reads; fast-prefix reads may
     // leave a suffix unseeded until the next fallback. Never overwrites records.
-    pub(crate) seen_sources: HashSet<SlotId>,
+    // Boxed lazily: the vast majority of readers never reach the hash-dedup
+    // threshold, so the inline HashSet (48 bytes) would waste node cache lines.
+    pub(crate) seen_sources: Option<Box<HashSet<SlotId>>>,
+}
+
+impl Default for TrackingContext {
+    fn default() -> Self {
+        Self {
+            execution_epoch: 0,
+            stable_prefix_cursor: 0,
+            diverged: false,
+            hashing: false,
+            seen_sources: None,
+        }
+    }
+}
+
+impl TrackingContext {
+    #[inline]
+    pub(crate) fn seen_len(&self) -> usize {
+        self.seen_sources.as_ref().map_or(0, |set| set.len())
+    }
+
+    #[inline]
+    pub(crate) fn seen_capacity(&self) -> usize {
+        self.seen_sources.as_ref().map_or(0, |set| set.capacity())
+    }
+
+    #[inline]
+    pub(crate) fn seen_is_empty(&self) -> bool {
+        self.seen_sources.as_ref().is_none_or(|set| set.is_empty())
+    }
+
+    #[inline]
+    pub(crate) fn seen_clear(&mut self) {
+        if let Some(set) = &mut self.seen_sources {
+            set.clear();
+        }
+    }
+
+    #[inline]
+    fn ensure_seen(&mut self) -> &mut HashSet<SlotId> {
+        match &mut self.seen_sources {
+            Some(set) => set,
+            None => {
+                let mut set = Box::new(HashSet::with_capacity(HASH_THRESHOLD + 1));
+                self.seen_sources.insert(set)
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn seen_extend(&mut self, iter: impl Iterator<Item = SlotId>) {
+        if self.hashing {
+            self.ensure_seen().extend(iter);
+        } else {
+            for _ in iter {}
+        }
+    }
+
+    #[inline]
+    pub(crate) fn seen_insert(&mut self, source: SlotId) -> bool {
+        self.ensure_seen().insert(source)
+    }
 }
 
 pub(crate) enum Payload {
@@ -122,6 +254,7 @@ pub(crate) enum Payload {
         value: Option<Value>,
         compute: Option<MemoCompute>,
         equals: Comparator,
+        fast_equals: Option<&'static EqualsDescriptor>,
     },
     Effect(Option<EffectCallback>),
 }
@@ -154,6 +287,17 @@ impl Payload {
             Err(RuntimeError::TypeMismatch)
         })
     }
+    /// Default `PartialEq` comparator with a monomorphic fast path stored in
+    /// the node. Avoids an `Rc<dyn Fn>` allocation at creation and two type
+    /// downcasts per comparison on write.
+    pub(crate) fn signal_default<T: PartialEq + 'static>(value: T) -> Self {
+        Self::Signal(SignalData {
+            value: Rc::new(RefCell::new(Some(value))),
+            value_type: &const { ValueType::of::<T>() },
+            equals: Rc::new(default_equals::<T>),
+            fast_equals: Some(&const { EqualsDescriptor::of::<T>() }),
+        })
+    }
     pub(crate) fn signal<T: 'static>(
         value: T,
         comparator: impl Fn(&T, &T) -> bool + 'static,
@@ -162,6 +306,7 @@ impl Payload {
             value: Rc::new(RefCell::new(Some(value))),
             value_type: &const { ValueType::of::<T>() },
             equals: Self::comparator(comparator),
+            fast_equals: None,
         })
     }
 
@@ -192,8 +337,22 @@ pub(crate) struct Metadata {
     pub(crate) invalidation_revision: u64,
     pub(crate) last_processed_round: Option<u64>,
     pub(crate) last_executed_round: Option<u64>,
-    pub(crate) failure: Option<Rc<RuntimeError>>,
+    // Cold field: only failed evaluations carry a payload. Boxed lazily so the
+    // common (non-failing) metadata keeps its original cache footprint.
+    pub(crate) failure: Option<Box<Rc<RuntimeError>>>,
     pub(crate) creation_sequence: u64,
+}
+
+impl Metadata {
+    #[inline]
+    pub(crate) fn set_failure(&mut self, failure: Option<Rc<RuntimeError>>) {
+        self.failure = failure.map(Box::new);
+    }
+
+    #[inline]
+    pub(crate) fn failure(&self) -> Option<&Rc<RuntimeError>> {
+        self.failure.as_deref()
+    }
 }
 
 pub(crate) struct Node {

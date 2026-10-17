@@ -384,7 +384,7 @@ impl Runtime {
             {
                 memory.read_heap_capacity_bytes += read_bytes;
             }
-            memory.dedup_capacity_entries += node.tracking.seen_sources.capacity();
+            memory.dedup_capacity_entries += node.tracking.seen_capacity();
         }
         Ok(RuntimeDiagnostics {
             runtime_identity: self.inner.id.0,

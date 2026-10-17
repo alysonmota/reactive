@@ -1,0 +1,6 @@
+{
+  "diagnostics": false,
+  "experimental_inline_reads": false,
+  "panic_unwind": true,
+  "verification": false
+}

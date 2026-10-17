@@ -606,7 +606,7 @@ impl Runtime {
         read: impl FnOnce() -> Result<Rc<RefCell<Option<T>>>, RuntimeError>,
         callback: impl FnOnce(&T) -> R,
     ) -> Result<R, RuntimeError> {
-        self.resource_boundary(
+        self.resource_boundary_read(
             (Some(callback), None),
             |inputs| {
                 inputs.1 = Some(read()?);
@@ -724,11 +724,45 @@ impl Runtime {
     /// stored only for future disposal, never for execution in a poisoned runtime.
     fn resource_boundary<I, R>(
         &self,
+        inputs: I,
+        callback: impl FnOnce(&mut I) -> R,
+        release: impl FnOnce(I) -> Option<PanicPayload>,
+    ) -> R {
+        self.resource_boundary_with_hook::<true, _, _>(
+            inputs,
+            callback,
+            release,
+        )
+    }
+
+    /// Read-only boundary: a pure read cannot mark observers dirty, so the
+    /// whole NotificationBoundary machinery is elided (const-generic). The
+    /// exit test still runs against the pre-existing depth: if the read was
+    /// reentrant inside an inflight publish whose marking phase poisoned the
+    /// runtime, the outermost notification is delivered exactly like before.
+    pub(crate) fn resource_boundary_read<I, R>(
+        &self,
+        inputs: I,
+        callback: impl FnOnce(&mut I) -> R,
+        release: impl FnOnce(I) -> Option<PanicPayload>,
+    ) -> R {
+        self.resource_boundary_with_hook::<false, _, _>(inputs, callback, release)
+    }
+
+    /// `MAY_NOTIFY` lets read-only entry points skip the notification-boundary
+    /// overhead entirely: a pure read cannot mark observers dirty, so no new
+    /// host flush request can become deliverable inside the window. Depth
+    /// accounting still applies whenever any code path may publish (writes,
+    /// effect scheduling, disposal, flush). All guards and panics semantics
+    /// are identical to the plain boundary; only the depth increment/decrement
+    /// and the exit test are elided for provably non-publishing operations.
+    fn resource_boundary_with_hook<const MAY_NOTIFY: bool, I, R>(
+        &self,
         mut inputs: I,
         callback: impl FnOnce(&mut I) -> R,
         release: impl FnOnce(I) -> Option<PanicPayload>,
     ) -> R {
-        let boundary = scheduling::NotificationBoundary::enter(self);
+        let boundary = MAY_NOTIFY.then(|| scheduling::NotificationBoundary::enter(self));
         #[cfg(panic = "unwind")]
         let outcome =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(&mut inputs)));
@@ -742,7 +776,16 @@ impl Runtime {
             }
         };
         self.merge_panic(&mut first, release(inputs));
-        let outermost = boundary.finish();
+        let outermost = match boundary {
+            Some(boundary) => boundary.finish(),
+            // No depth was taken here; delivery is only possible when this
+            // window ran reentrantly inside an inflight publish (depth 0)
+            // that failed and poisoned the runtime mid-marking.
+            None => {
+                self.inner.notification_depth.get() == 0
+                    && self.inner.status() != RuntimeStatus::Healthy
+            }
+        };
         if first.is_none() && outermost {
             // Keep returned resources outside the hook catch as well.
             #[cfg(panic = "unwind")]
@@ -913,9 +956,9 @@ impl Drop for EvaluationGuard<'_> {
             node.metadata.phase = crate::EvaluationPhase::Idle;
             if let Some(failure) = failure {
                 node.metadata.state = crate::State::Dirty;
-                node.metadata.failure = Some(failure);
+                node.metadata.set_failure(Some(failure));
                 node.reads.clear();
-                node.tracking.seen_sources.clear();
+                node.tracking.seen_clear();
             }
         }
     }
@@ -1044,6 +1087,7 @@ mod tests {
                         value: None,
                         compute: Some(Box::new(|_, _| Ok(Rc::new(RefCell::new(Some(42_u32)))))),
                         equals: Payload::comparator::<u32>(u32::eq),
+                        fast_equals: None,
                     })
                     .map(Memo::new)
             })
@@ -1246,6 +1290,7 @@ mod tests {
                     value: Some(Rc::new("wrong type")),
                     compute: Some(Box::new(|_, _| Ok(Rc::new(RefCell::new(Some(42_u32)))))),
                     equals: Payload::comparator::<u32>(u32::eq),
+                        fast_equals: None,
                 })
             })
             .unwrap();

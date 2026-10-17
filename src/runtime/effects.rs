@@ -522,7 +522,7 @@ impl Runtime {
                         }
                         if self.status() == RuntimeStatus::Poisoned {
                             node.metadata.state = State::Dirty;
-                            node.metadata.failure = self.first_failure();
+                            node.metadata.set_failure(self.first_failure());
                         }
                     }
                     drop(storage);

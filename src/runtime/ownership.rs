@@ -1363,7 +1363,7 @@ mod tests {
             let storage = runtime.inner.storage.borrow();
             let node = storage.nodes.get(effect.id.slot).unwrap();
             assert!(node.reads.is_empty());
-            assert!(node.tracking.seen_sources.is_empty());
+            assert!(node.tracking.seen_is_empty());
             assert_eq!(
                 node.sources
                     .iter()
