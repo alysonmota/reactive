@@ -21,8 +21,12 @@ def main():
         parser.error("invalid label")
     directory = LOG / "runs" / args.label
     directory.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ, CARGO_PROFILE_RELEASE_STRIP="none", CARGO_PROFILE_RELEASE_DEBUG="line-tables-only")
-    command = ["cargo", "bench", "--locked", "--profile", "release", "--no-default-features", "--bench", "comparison", "--no-run", "--message-format=json"]
+    env = dict(os.environ)
+    if 'CARGO_ENCODED_RUSTFLAGS' in env:
+        env['CARGO_ENCODED_RUSTFLAGS'] += '\x1f-C\x1fpanic=abort'
+    else:
+        env['RUSTFLAGS'] = (env.get('RUSTFLAGS', '') + ' -C panic=abort').strip()
+    command = ["cargo", "bench", "--locked", "--profile", "profiling", "--no-default-features", "--bench", "comparison", "--no-run", "--message-format=json"]
     build = subprocess.run(command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     (directory / "build.log").write_text(build.stdout)
     build.check_returncode()

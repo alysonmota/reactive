@@ -38,7 +38,15 @@ def main():
     roots = {"a": args.baseline_directory.resolve() if args.baseline_directory else ROOT,
              "b": args.candidate_directory.resolve() if args.candidate_directory else ROOT}
     def environment(variant):
-        return dict(os.environ, CARGO_TARGET_DIR=f"/tmp/opencode/reactive-{args.target_prefix or args.label}-{variant}-target")
+        env = dict(os.environ, CARGO_TARGET_DIR=f"/tmp/opencode/reactive-{args.target_prefix or args.label}-{variant}-target")
+        if 'CARGO_ENCODED_RUSTFLAGS' in env:
+            if not env['CARGO_ENCODED_RUSTFLAGS'].endswith('-C\x1fpanic=abort'):
+                env['CARGO_ENCODED_RUSTFLAGS'] += '\x1f-C\x1fpanic=abort'
+        else:
+            if not env.get('RUSTFLAGS', '').rstrip().endswith('-C panic=abort'):
+                env['RUSTFLAGS'] = (env.get('RUSTFLAGS', '') + ' -C panic=abort').strip()
+        env['REACTIVE_REQUIRE_ABORT'] = '1'
+        return env
     # Finish both builds before measuring: no compiler activity between blocks.
     builds = {}
     for variant in "ab":

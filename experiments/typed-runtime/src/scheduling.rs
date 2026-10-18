@@ -200,8 +200,6 @@ impl Runtime {
                 }
             };
             report.rounds += 1;
-            let _shared_round = shared_plan::begin_round(self);
-            let _ordered_round = ordered::begin_round(self);
             #[cfg(feature = "topology-diagnostics")]
             let _topology_round = topology::begin_round(self);
             for i in 0..count {

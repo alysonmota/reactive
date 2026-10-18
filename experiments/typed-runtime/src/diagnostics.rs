@@ -114,11 +114,7 @@ impl Runtime {
                     * std::mem::size_of::<Key>(),
                 scratch_capacity_bytes: g.marks.capacity() * std::mem::size_of::<(Key, State)>()
                     + self.0.frames.borrow().capacity() * std::mem::size_of::<evaluation::Frame>()
-                    + self.0.validation_frames.borrow().capacity()
-                        * std::mem::size_of::<planning::Frame>()
-                    + self.0.shared_frames.borrow().capacity()
-                        * std::mem::size_of::<shared_plan::Frame>()
-                    + self.0.shared_plan.borrow().capacity_bytes(),
+                    + self.0.fused_frames.borrow().capacity() * std::mem::size_of::<fused::Frame>(),
                 node_size: std::mem::size_of::<Hot>() + std::mem::size_of::<Cold>(),
                 metadata_size: std::mem::size_of::<Hot>(),
                 ..Default::default()

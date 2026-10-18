@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import statistics
 import subprocess
+import shutil
 
 ROOT = Path(__file__).resolve().parent.parent
 LOG = ROOT / 'benches/.log'
@@ -18,7 +19,7 @@ spec.loader.exec_module(runner)
 FAMILIES = ['chain_write_to_observed', 'diamond_write_to_observed',
             'fan_out_write_to_observed', 'conditional_write_to_observed', 'p1p2_cut']
 MODES = {'production': ('reactive', 'full'), 'full': ('typed_research', 'full'),
-         'local': ('typed_research', 'local'), 'local-dirty': ('typed_research', 'local-dirty'),
+          'topological': ('typed_research', 'topological'),
          'sycamore': ('sycamore', 'full'), 'leptos': ('leptos', 'full')}
 
 
@@ -40,15 +41,21 @@ def main():
     env.pop('REACTIVE_CHAIN_INVESTIGATION', None)
     runner.lifecycle.STEP_TIMEOUT = 240
     binary, identity = runner.build('comparison', directory, args.label, env)
+    sealed = directory / 'sealed-binary'
+    shutil.copyfile(binary, sealed)
+    sealed.chmod(0o755)
+    binary = sealed.resolve()
+    identity = {'path': str(binary), 'sha256': runner.digest(binary)}
     sources = {str(p.relative_to(ROOT)): runner.digest(p)
                for pattern in ['src/**/*.rs', 'experiments/**/*.rs', 'benches/**/*.rs',
                                'Cargo.toml', 'Cargo.lock', 'experiments/**/Cargo.toml',
                                'benches/compare-current-references.py', 'benches/run-p1p2.py']
                for p in ROOT.glob(pattern)}
     modes = list(MODES)
+    cycle_width = len(modes) * 2
     schedule = (modes + list(reversed(modes))) * 2
     result = dict(binary=identity, source_sha256=sources, modes=MODES, schedule=schedule,
-                  cpu=args.cpu, profile='release', diagnostics=False, size=256,
+                   cpu=args.cpu, profile='bench-abort', panic='abort', rustflags=env.get('RUSTFLAGS'), diagnostics=False, size=256,
                   rustc=subprocess.check_output(['rustc', '-Vv'], text=True),
                   system=platform.uname()._asdict(), runs=[],
                   limits=['Five scalar fixtures, not complete API/contract equivalence',
@@ -56,7 +63,7 @@ def main():
                           'Balanced placement, not a dedicated sham or statistical significance test',
                           'No historical timing combined with this series'])
     destination = LOG / (args.label + '.json')
-    for mode in ['full', 'local', 'local-dirty']:
+    for mode in ['full', 'topological']:
         env['TYPED_EVALUATION'] = mode
         env['REACTIVE_BENCH_LOG'] = str(directory / ('smoke-' + mode))
         with (directory / ('smoke-' + mode + '.log')).open('w') as out:
@@ -90,12 +97,12 @@ def main():
             return (e.get('slope') or e['mean'])['point_estimate']
         means = {m: statistics.mean(point(r) for r in result['runs'] if r['label'] == m) for m in modes}
         ratios = {}
-        for mode in modes[:4]:
+        for mode in ['production', 'full', 'topological']:
             ratios[mode] = {}
-            for reference in modes[4:]:
+            for reference in ['sycamore', 'leptos']:
                 cycles = []
-                for start in [0, 12]:
-                    cycle = result['runs'][start:start + 12]
+                for start in [0, cycle_width]:
+                    cycle = result['runs'][start:start + cycle_width]
                     def gm(label):
                         return math.exp(statistics.mean(math.log(point(r)) for r in cycle if r['label'] == label))
                     cycles.append(gm(mode) / gm(reference))

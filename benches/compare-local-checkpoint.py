@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import statistics
 import subprocess
+import shutil
 
 ROOT=Path(__file__).resolve().parent.parent
 LOG=ROOT/'benches/.log'
@@ -17,20 +18,26 @@ runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 
 def main():
     parser=argparse.ArgumentParser(__doc__)
-    parser.add_argument('--label',default='local-plan-v4-abba')
-    parser.add_argument('--baseline',type=Path,default=LOG/'runs/local-plan-diagnosis-v1/baseline.json')
+    parser.add_argument('--label',required=True)
+    parser.add_argument('--baseline',type=Path,required=True)
+    parser.add_argument('--modes',nargs='+',default=['full','topological'])
     args=parser.parse_args()
     assert args.label and all(c.isalnum() or c in '-_' for c in args.label)
     directory=LOG/'runs'/args.label;directory.mkdir(parents=True,exist_ok=False)
     baseline=json.loads(args.baseline.read_text())
-    old=Path(baseline['binary']['path']);assert runner.digest(old)==baseline['binary']['sha256']
+    old_identity=baseline.get('candidate') or baseline['binary']
+    old=Path(old_identity['path']);assert runner.digest(old)==old_identity['sha256']
+    assert baseline.get('panic')=='abort','Only effective-abort baselines may be compared'
     env=dict(os.environ,CARGO_TARGET_DIR='/tmp/opencode/reactive-p1p2-lab-target',REACTIVE_TYPED_PROTOTYPE='1')
     runner.lifecycle.STEP_TIMEOUT=240
     new,identity=runner.build('comparison',directory,args.label,env)
+    sealed=directory/'sealed-binary';shutil.copyfile(new,sealed);sealed.chmod(0o755)
+    new=sealed;identity={'path':str(sealed.resolve()),'sha256':runner.digest(sealed)}
     source={str(p.relative_to(ROOT)):runner.digest(p) for pattern in ['src/**/*.rs','experiments/**/*.rs','benches/**/*.rs','tests/**/*.rs','Cargo.toml','Cargo.lock','experiments/**/Cargo.toml','benches/compare-local-checkpoint.py'] for p in ROOT.glob(pattern)}
-    result={'baseline':baseline,'candidate':identity,'source_sha256':source,'cpu':2,'schedule':list('abba')*2,'runs':{},'summary':{},'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'limits':['Different sealed executables; paired before/after bundle, not per-function cost','Release without diagnostics; CPU pinned, not physical isolation','No reference-engine timing']}
+    (directory/'source-bundle.json').write_text(json.dumps({p:(ROOT/p).read_text() for p in source}))
+    result={'baseline':baseline,'candidate':identity,'source_sha256':source,'panic':'abort','rustflags':env.get('RUSTFLAGS'),'cpu':2,'schedule':list('abba')*2,'runs':{},'summary':{},'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'limits':['Different sealed executables; paired before/after bundle, not per-function cost','Release without diagnostics; CPU pinned, not physical isolation','No reference-engine timing']}
     pattern=r'((chain|diamond|fan_out|conditional)_write_to_observed|p1p2_cut)/typed_research/256$|contract_(owner_resources|writable_effects)/typed_research/8$'
-    for mode in ['local','local-dirty']:
+    for mode in args.modes:
         env['TYPED_EVALUATION']=mode;runs=[]
         for i,variant in enumerate(result['schedule']):
             block=directory/f'{mode}-{i+1}-{variant}';block.mkdir()
@@ -43,7 +50,7 @@ def main():
             estimates={str(p.parent.parent.relative_to(block/'criterion')):json.loads(p.read_text()) for p in (block/'criterion').glob('**/new/estimates.json')}
             assert len(estimates)==7
             runs.append({'variant':variant,'command':command,'estimates':estimates})
-            assert runner.digest(old)==baseline['binary']['sha256'] and runner.digest(new)==identity['sha256']
+            assert runner.digest(old)==old_identity['sha256'] and runner.digest(new)==identity['sha256']
             assert all(runner.digest(ROOT/p)==h for p,h in source.items())
         result['runs'][mode]=runs
         summary={}

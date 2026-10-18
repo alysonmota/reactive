@@ -1,19 +1,9 @@
 use super::*;
 use crate::production_support::{effect, flush, memo, signal};
 
-const MODES: [EvaluationStrategy; 12] = [
+const MODES: [EvaluationStrategy; 2] = [
     EvaluationStrategy::FullFrames,
-    EvaluationStrategy::LightFrames,
     EvaluationStrategy::DemandDriven,
-    EvaluationStrategy::SharedPlan,
-    EvaluationStrategy::SharedPlanDirty,
-    EvaluationStrategy::SharedPlanOptimized,
-    EvaluationStrategy::SharedPlanDirtyOptimized,
-    EvaluationStrategy::GlobalPlan,
-    EvaluationStrategy::GlobalPlanDirty,
-    EvaluationStrategy::LocalPlan,
-    EvaluationStrategy::LocalPlanDirty,
-    EvaluationStrategy::OrderedDemand,
 ];
 fn runtime(mode: EvaluationStrategy) -> (Runtime, OwnerHandle) {
     let r = Runtime::with_evaluation_strategy(mode);

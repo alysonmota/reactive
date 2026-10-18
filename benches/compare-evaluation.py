@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded balanced full/light/topological comparison, one release executable."""
+"""Bounded balanced full/topological comparison, one effective-abort executable."""
 import argparse
 import hashlib
 import importlib.util
@@ -17,26 +17,17 @@ runner=importlib.util.module_from_spec(spec);spec.loader.exec_module(runner)
 
 def main():
     p=argparse.ArgumentParser(__doc__);p.add_argument('label');p.add_argument('--cpu',type=int,default=2)
-    p.add_argument('--sham',action='store_true',help='Run FullFrames under all three labels to measure noise')
-    p.add_argument('--shared',action='store_true',help='Compare FullFrames, SharedPlan and SharedPlanDirty')
-    p.add_argument('--optimized',choices=['full','shared','shared-dirty'],help='Control versus both stage-8 specializations')
-    p.add_argument('--global-plan',action='store_true',help='Compare FullFrames with both executable global-DAG policies')
-    p.add_argument('--local-plan',action='store_true',help='Compare both instruction-local plan policies')
-    p.add_argument('--ordered',action='store_true',help='Compare ordered gate bytecode against FullFrames and LocalPlan')
-    p.add_argument('--control',choices=['full','global','global-dirty'],default='full',help='Control for --local-plan')
+    p.add_argument('--sham',action='store_true',help='Run FullFrames under both labels to measure noise')
     a=p.parse_args();assert a.label and all(c.isalnum() or c in '-_' for c in a.label)
     directory=LOG/'runs'/a.label;directory.mkdir(parents=True,exist_ok=False)
     env=dict(os.environ,CARGO_TARGET_DIR='/tmp/opencode/reactive-p1p2-lab-target',REACTIVE_TYPED_PROTOTYPE='1')
     source={str(p.relative_to(ROOT)):runner.digest(p) for pattern in ['src/**/*.rs','experiments/**/*.rs','benches/**/*.rs','tests/p1p2*.rs','tests/p1p2_support/**/*.rs','Cargo.toml','Cargo.lock','experiments/**/Cargo.toml','benches/compare-evaluation.py','benches/run-p1p2.py'] for p in ROOT.glob(pattern)}
     runner.lifecycle.STEP_TIMEOUT=240
     binary,identity=runner.build('comparison',directory,a.label,env)
-    result={'label':a.label,'sham':a.sham,'binary':identity,'source_sha256':source,'cpu':a.cpu,'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'runs':[],'schedule':list('flttlf')*2,'limitations':['CPU-pinned balanced same-executable timing; not independent safety review','All policies retain production semantics; only typed engine timed','Historical reference times are not paired against this experiment']}
+    result={'label':a.label,'sham':a.sham,'binary':identity,'source_sha256':source,'cpu':a.cpu,'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'runs':[],'schedule':list('fttf')*3,'limitations':['CPU-pinned balanced same-executable timing; not independent safety review','All policies retain production semantics; only typed engine timed','Historical reference times are not paired against this experiment']}
     pattern=r'((chain|diamond|fan_out|conditional)_write_to_observed|p1p2_cut)/typed_research/256$|contract_(owner_resources|writable_effects)/typed_research/8$'
-    modes={'f':'full','l':'shared' if a.shared else 'light','t':'shared-dirty' if a.shared else 'topological'}
-    if a.optimized:modes={'f':a.optimized,'l':'shared-opt','t':'shared-dirty-opt'}
-    if a.global_plan:modes={'f':'full','l':'global','t':'global-dirty'}
-    if a.local_plan:modes={'f':a.control,'l':'local','t':'local-dirty'}
-    if a.ordered:modes={'f':'full','l':'ordered','t':'local'}
+    modes={'f':'full','t':'topological'}
+    result['panic']='abort';result['rustflags']=env.get('RUSTFLAGS');result['encoded_rustflags']=env.get('CARGO_ENCODED_RUSTFLAGS')
     result['modes']=modes
     for mode in modes.values():
         env['TYPED_EVALUATION']=mode
@@ -60,10 +51,10 @@ def main():
         def point(i):
             d=result['runs'][i]['estimates'][key];return (d.get('slope') or d['mean'])['point_estimate']
         row={'means_ns':{m:statistics.mean(point(i) for i,r in enumerate(result['runs']) if r['variant']==v) for v,m in modes.items()}}
-        for mode,pair in [(modes['l'],(1,4)),(modes['t'],(2,3))]:
-            ratios=[math.sqrt(point(start+pair[0])*point(start+pair[1])/point(start)/point(start+5)) for start in [0,6]]
+        for mode,pair in [(modes['t'],(1,2))]:
+            ratios=[math.sqrt(point(start+pair[0])*point(start+pair[1])/point(start)/point(start+3)) for start in [0,4,8]]
             row[mode+'_cycle_percent']=[100*(r-1) for r in ratios]
-            row[mode+'_paired_percent']=100*(math.sqrt(math.prod(ratios))-1)
+            row[mode+'_paired_percent']=100*(math.prod(ratios)**(1/len(ratios))-1)
         summary[key]=row
     result['summary']=summary
     assert runner.digest(binary)==identity['sha256']

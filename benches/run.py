@@ -58,7 +58,8 @@ def main():
     directory = LOG / "runs" / args.label
     directory.mkdir(parents=True, exist_ok=False)
     target = "comparison" if args.suite == "chain" else args.suite
-    command = ["cargo", "bench", "--locked", "--profile", "release", "--no-default-features", "--bench", target]
+    profile = "profiling" if args.profile_seconds is not None else "release"
+    command = ["cargo", "bench", "--locked", "--profile", profile, "--no-default-features", "--bench", target]
     features = (["diagnostics"] if args.suite == "memory" else []) + (["experimental-inline-reads"] if args.inline_reads else [])
     if features:
         command += ["--features", ",".join(features)]
@@ -74,17 +75,21 @@ def main():
         command = ["taskset", "-c", str(args.cpu)] + command
     files = sorted(set(ROOT.glob("src/**/*.rs")) | set(ROOT.glob("benches/**/*.rs")) | {ROOT / "Cargo.toml", ROOT / "Cargo.lock", Path(__file__).resolve()} | {p for p in [ROOT / ".cargo/config.toml", ROOT / "rust-toolchain.toml"] if p.exists()})
     environment = dict(os.environ)
+    if 'CARGO_ENCODED_RUSTFLAGS' in environment:
+        if not environment['CARGO_ENCODED_RUSTFLAGS'].endswith('-C\x1fpanic=abort'):
+            environment['CARGO_ENCODED_RUSTFLAGS'] += '\x1f-C\x1fpanic=abort'
+    else:
+        if not environment.get('RUSTFLAGS', '').rstrip().endswith('-C panic=abort'):
+            environment['RUSTFLAGS'] = (environment.get('RUSTFLAGS', '') + ' -C panic=abort').strip()
+    environment['REACTIVE_REQUIRE_ABORT'] = '1'
     if args.suite == "chain":
         environment["REACTIVE_CHAIN_INVESTIGATION"] = "1"
     environment["REACTIVE_BENCH_LOG"] = str(directory / "criterion")
     environment["REACTIVE_METRICS_LOG"] = str(directory / "metrics.json")
-    if args.profile_seconds is not None:
-        environment["CARGO_PROFILE_RELEASE_STRIP"] = "none"
-        environment["CARGO_PROFILE_RELEASE_DEBUG"] = "line-tables-only"
     metadata = {
         "label": args.label, "started": datetime.now(timezone.utc).isoformat(),
-        "command": command, "profile": "release", "features": features, "instrumented": args.suite == "memory",
-        "environment": {k: v for k, v in environment.items() if k in ["RUSTFLAGS", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "CARGO_TARGET_DIR", "REACTIVE_BENCH_LOG", "REACTIVE_METRICS_LOG", "REACTIVE_CHAIN_INVESTIGATION"] or k.startswith("CARGO_PROFILE_")},
+        "command": command, "profile": profile, "panic": "abort", "features": features, "instrumented": args.suite == "memory",
+        "environment": {k: v for k, v in environment.items() if k in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "REACTIVE_REQUIRE_ABORT", "RUSTUP_TOOLCHAIN", "CARGO_HOME", "CARGO_TARGET_DIR", "REACTIVE_BENCH_LOG", "REACTIVE_METRICS_LOG", "REACTIVE_CHAIN_INVESTIGATION"] or k.startswith("CARGO_PROFILE_")},
         "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
         "rustc": capture(["rustc", "-Vv"]), "cargo": capture(["cargo", "-V"]),
         "cpu": capture(["lscpu"]), "system": capture(["uname", "-a"]),

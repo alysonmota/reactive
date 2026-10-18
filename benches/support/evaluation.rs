@@ -7,17 +7,7 @@ pub fn runtime() -> typed_runtime_prototype::Runtime {
         .unwrap_or("full")
     {
         "full" => EvaluationStrategy::FullFrames,
-        "light" => EvaluationStrategy::LightFrames,
         "topological" => EvaluationStrategy::DemandDriven,
-        "shared" => EvaluationStrategy::SharedPlan,
-        "shared-dirty" => EvaluationStrategy::SharedPlanDirty,
-        "shared-opt" => EvaluationStrategy::SharedPlanOptimized,
-        "shared-dirty-opt" => EvaluationStrategy::SharedPlanDirtyOptimized,
-        "global" => EvaluationStrategy::GlobalPlan,
-        "global-dirty" => EvaluationStrategy::GlobalPlanDirty,
-        "local" => EvaluationStrategy::LocalPlan,
-        "local-dirty" => EvaluationStrategy::LocalPlanDirty,
-        "ordered" => EvaluationStrategy::OrderedDemand,
         other => panic!("unknown TYPED_EVALUATION: {other}"),
     };
     Runtime::with_evaluation_strategy(strategy)

@@ -70,7 +70,6 @@ impl Runtime {
         self.0.notification_outstanding.set(true);
         let _caps = Caps::enter(0);
         let _reader = ReaderRuntime::enter(None);
-        let _callback = shared_plan::Callback::enter(self);
         let outcome = catch_unwind(AssertUnwindSafe(|| hook(self)));
         *self.0.hook.borrow_mut() = Some(hook);
         if let Err(p) = outcome {

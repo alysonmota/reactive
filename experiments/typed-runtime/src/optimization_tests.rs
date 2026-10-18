@@ -3,27 +3,14 @@ use production_support::{effect, flush, forge, memo, pair, signal};
 
 fn arena(r: &Runtime) -> (usize, *const ()) {
     assert!(r.0.frames.borrow().is_empty());
-    assert!(r.0.validation_frames.borrow().is_empty());
-    assert!(r.0.shared_frames.borrow().is_empty());
+    assert!(r.0.fused_frames.borrow().is_empty());
     match r.0.strategy {
-        EvaluationStrategy::OrderedDemand => r.0.ordered.borrow().arena(),
         EvaluationStrategy::FullFrames => {
             let f = r.0.frames.borrow();
             (f.capacity(), f.as_ptr().cast())
         }
-        EvaluationStrategy::SharedPlan
-        | EvaluationStrategy::SharedPlanDirty
-        | EvaluationStrategy::SharedPlanOptimized
-        | EvaluationStrategy::SharedPlanDirtyOptimized
-        | EvaluationStrategy::GlobalPlan
-        | EvaluationStrategy::GlobalPlanDirty
-        | EvaluationStrategy::LocalPlan
-        | EvaluationStrategy::LocalPlanDirty => {
-            let f = r.0.shared_frames.borrow();
-            (f.capacity(), f.as_ptr().cast())
-        }
-        _ => {
-            let f = r.0.validation_frames.borrow();
+        EvaluationStrategy::DemandDriven => {
+            let f = r.0.fused_frames.borrow();
             (f.capacity(), f.as_ptr().cast())
         }
     }
@@ -312,6 +299,7 @@ fn committed_chain_reuses_iterative_frames_and_respects_logical_depth_limit() {
         r.set(s, n).unwrap();
         assert_eq!(r.get(tail), Ok(n + 255));
         assert!(r.0.frames.borrow().is_empty());
+        assert!(r.0.fused_frames.borrow().is_empty());
         assert!(arena(&r).0 >= 256);
         assert_eq!(r.0.depth.get(), 0);
         assert_eq!(r.0.pending_owner.get(), None);
@@ -337,7 +325,7 @@ fn committed_chain_reuses_iterative_frames_and_respects_logical_depth_limit() {
     assert!(!PURE.get());
     assert_eq!(READER_RUNTIME.get(), None);
     assert!(r.0.frames.borrow().is_empty());
-    assert!(r.0.validation_frames.borrow().is_empty());
+    assert!(r.0.fused_frames.borrow().is_empty());
     r.verify_invariants().unwrap();
 }
 
@@ -369,7 +357,7 @@ fn nested_session_failure_restores_all_frames_and_keeps_original_failure() {
         assert_eq!(r.0.reader.get(), None);
         assert_eq!(CAPS.get(), ALL);
         assert!(r.0.frames.borrow().is_empty());
-        assert!(r.0.validation_frames.borrow().is_empty());
+        assert!(r.0.fused_frames.borrow().is_empty());
         assert_eq!(
             r.first_failure().as_deref(),
             Some(&if panic {

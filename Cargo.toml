@@ -38,6 +38,10 @@ name = "p1p2_memory"
 harness = false
 
 [[bench]]
+name = "walk_diagnostic"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
 required-features = ["diagnostics"]
@@ -53,6 +57,10 @@ strip = "symbols"
 inherits = "release"
 debug = "full"
 strip = "none"
+
+[profile.bench-abort]
+inherits = "release"
+panic = "abort"
 
 [profile.fast-dev]
 inherits = "dev"

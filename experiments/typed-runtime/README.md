@@ -7,84 +7,37 @@ dev-dependency** da biblioteca principal. Não altera sua API ou código em src/
 
 ### Experimentos de avaliação selecionáveis
 
-O default continua `FullFrames`. Os dois modos novos são opt-in, sem alterar
+O default continua `FullFrames`. `DemandDriven` é opt-in, sem alterar
 o scheduler de effects nem tornar propagação eager:
 
 ```rust
 use typed_runtime_prototype::{EvaluationStrategy, Runtime};
 let runtime = Runtime::with_evaluation_strategy(EvaluationStrategy::DemandDriven);
-// Alternativa de comparação: EvaluationStrategy::LightFrames.
 ```
 
-LightFrames conserva transições individuais com frames leves de validação;
-DemandDriven funde o avanço da fronteira topológica até o próximo callback.
-Ambos preservam lazy/equality cut e revalidam depois de callbacks. Não há lista
+DemandDriven usa frames de 32 B (em 64 bits), contexto por sessão e funde
+o avanço da fronteira topológica até o próximo callback. Preserva lazy/equality
+cut e revalida depois de callbacks. Não há lista
 especulativa executando todas as fontes antigas. Política fixa por Runtime.
 
-Fixtures/host tests selecionam via `TYPED_EVALUATION=full|light|topological`;
+Fixtures/host tests selecionam via `TYPED_EVALUATION=full|topological`;
 o runtime normal não lê essa variável. Testes unitários cfg(test) a encaminham
-ao construtor explicitamente para repetir a mesma suíte nos três modos.
-Resultados e limites: `benches/.log/DEMAND-DRIVEN-EVALUATION.md`.
+ao construtor explicitamente para repetir a mesma suíte nos dois modos.
+Resultados e limites atuais: `../../benches/LOGICAL-PREPARE.md`.
 
-Etapas 4–7 acrescentam dois experimentos, sem trocar o default:
+Somente esses dois modos permanecem. LightFrames foi removido. Os experimentos SharedPlan, GlobalPlan,
+LocalPlan (incluindo suas variantes Dirty/Optimized) e OrderedDemand foram
+removidos, junto com storage, ranks, instruções, epochs e hooks de manutenção.
+Os snapshots públicos específicos desses planos também foram retirados da
+API experimental. Nenhuma variante Dirty imediata foi mantida; invalidação
+lazy transitiva/equality cut e o scheduler de duas filas continuam intactos.
 
-```rust
-let rt = Runtime::with_evaluation_strategy(EvaluationStrategy::SharedPlan);
-let dirty = Runtime::with_evaluation_strategy(EvaluationStrategy::SharedPlanDirty);
-```
-
-SharedPlan interpreta programas de validação por nó, compartilhados na rodada,
-e recompila certificados após callbacks. Não executa a lista conservadora de
-shadow planning como se todos os seus nós fossem necessários. SharedPlanDirty
-também promove consumidores imediatos para Dirty após publicação diferente;
-**mantém a invalidação transitiva como fallback de leituras lazy**. Não é uma
-troca para propagação exclusivamente imediata. Seleção de hosts/tests:
-`TYPED_EVALUATION=shared|shared-dirty`. Metadados opcionais de progresso via
-`shared_plan_snapshot()` com diagnostics. Detalhes em
-`benches/.log/SHARED-PLAN-EXECUTOR.md`.
-
-Etapa 8: `SharedPlanOptimized` / `SharedPlanDirtyOptimized`, selecionáveis em
-hosts por `shared-opt` / `shared-dirty-opt`, preservam os modos anteriores como
-controles. Especializam Dirty, preservam prefixos de instruções revalidados e
-fundem pop/resume no mesmo kernel. Não implementam um executor da ordem global
-do shadow planner. Evidências: `benches/.log/SHARED-PLAN-SPECIALIZATION.md`.
-
-Pipeline topológico executável: `EvaluationStrategy::GlobalPlan` e
-`EvaluationStrategy::GlobalPlanDirty` (`TYPED_EVALUATION=global|global-dirty`
-nos hosts/tests). Um DAG postorder compartilhado contém slots e saltos para
-fontes; o executor usa esses endereços, mas só entra no próximo trecho
-demandado. A variante Dirty também ordena promoções imediatas por esses slots.
-Não existe sweep eager de todos os descendentes. Callbacks invalidam o plano;
-topologia estável é revalidada e reparada, mudança estrutural reconstrói o DAG.
-`executable_plan_snapshot()` com diagnostics expõe ordem/cursor/builds/repairs.
-Todos os modos anteriores continuam selecionáveis e FullFrames continua
-default. Detalhes, limites e evidência: `benches/.log/GLOBAL-PLAN-EXECUTOR.md`.
-
-Correção da revalidação global: `EvaluationStrategy::LocalPlan` e
-`EvaluationStrategy::LocalPlanDirty` (`local` / `local-dirty` nos hosts).
-Reutilizam a ordem entre rodadas de estrutura estável, leem a próxima Source atual e
-acrescentam somente subgrafos de novas demandas ainda ausentes. Publicação
-imediata não reconstrói/revalida o DAG. A ordem exposta é o snapshot inicial
-mais segmentos dinâmicos, não uma ordenação global refeita após cada callback.
-Os modos GlobalPlan antigos permanecem controles, não recomendações de uso.
-Evidências: `benches/.log/LOCAL-PLAN-REPAIR.md`.
-Diagnóstico por perf e correções posteriores (sem criar novos modos):
-`benches/.log/LOCAL-PLAN-DIAGNOSIS.md`. O relatório v1 acima é histórico; sua
-aprovação Miri não se transfere às mudanças posteriores.
-
-Checkpoint atual local v6: retorno Clean antes da preparação da sessão, slots
-de instrução persistentes (não ranks), e ranks separados para ordenar múltiplas
-promoções imediatas. Reconciliação/disposal invalidam somente os ranks afetados;
-trocas de fontes não recompilam todas as instruções na rodada seguinte.
-Resultados e limites: `benches/.log/LOCAL-INCREMENTAL-REPAIR.md`. Conditional
-melhorou; o ganho de Diamond não foi demonstrado. FullFrames continua padrão.
-
-Experimento de execução por bytecode ordenado: `EvaluationStrategy::OrderedDemand`
-(`ordered` nos hosts). Compila metadados em pós-ordem, interpreta Gates de fonte
-e Execute com retornos encadeados no próprio programa, sem chamar avaliadores
-de frames. Mantém demanda, equality cut, promoção imediata e as duas filas.
-Ainda perdeu para FullFrames nas fixtures sem cut; não promovido. Detalhes e
-evidência nova: `benches/.log/ORDERED-DEMAND-EXECUTOR.md`.
+Os relatórios `benches/.log/{SHARED-PLAN*,GLOBAL-PLAN*,LOCAL-*,ORDERED-*}` são
+históricos de versões retiradas, não instruções de uso da revisão atual.
+Auditoria anterior: `benches/WALK-COST-AUDIT.md`. Medição final por fase,
+remoção dos planos e baseline com abort efetivo:
+`benches/WALK-PHASES.md`. O diagnóstico de topologia abaixo continua opcional,
+fora do caminho normal e sem governar execução.
 
 ### Planejamento compartilhado em modo diagnóstico (etapas 2–3)
 

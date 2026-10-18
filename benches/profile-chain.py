@@ -61,7 +61,8 @@ def main():
                               'Deep recursive stacks may exceed captured user stack or unwind limits',
                               'Inclusive recursive frame percentages cannot be summed',
                               'Record includes fixture preflights, setup and teardown; profile-time dominates but does not exclude them']}
-    env = dict(os.environ, REACTIVE_TYPED_PROTOTYPE='1', DEBUGINFOD_URLS='')
+    env = dict(os.environ, REACTIVE_TYPED_PROTOTYPE='1', DEBUGINFOD_URLS='', REACTIVE_REQUIRE_ABORT='1')
+    result['required_panic']='abort'
     env.pop('REACTIVE_CHAIN_INVESTIGATION', None)
     commands = []
 

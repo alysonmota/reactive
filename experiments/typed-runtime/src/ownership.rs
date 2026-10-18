@@ -22,6 +22,24 @@ pub(super) struct PendingOwner {
     pub node: Key,
     pub epoch: u64,
 }
+// Callback-free logical scope renewal. The caller owns the graph kernel and
+// has already resolved the executing node's Key. Physical scopes never enter
+// this helper: their disposal/cleanup protocol remains in prepare_execution.
+#[inline(always)]
+fn defer_execution(g: &mut Graph, key: Key, parent: Key) -> Result<()> {
+    owner(g, parent)?
+        .depth
+        .checked_add(1)
+        .ok_or(Error::DepthLimit)?;
+    if !g.cold[key.index as usize].as_ref().unwrap().scope_deferred {
+        let position = owner(g, parent)?.children.len();
+        owner_mut(g, parent)?.children.push(Child::Deferred(key));
+        let c = g.cold[key.index as usize].as_mut().unwrap();
+        c.scope_deferred = true;
+        c.scope_position = position;
+    }
+    Ok(())
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Child {
     Physical(Key),
@@ -198,7 +216,7 @@ struct Retired {
 }
 
 // Called only with graph access, never calls user code or drops a payload.
-fn detach_node(rt: &Runtime, g: &mut Graph, key: Key) -> Cold {
+fn detach_node(g: &mut Graph, key: Key) -> Cold {
     let c = g.cold[key.index as usize].take().unwrap();
     if c.scope_deferred && owner(g, c.owner).is_ok() {
         remove_child(g, c.owner, c.scope_position, Child::Deferred(key));
@@ -215,7 +233,6 @@ fn detach_node(rt: &Runtime, g: &mut Graph, key: Key) -> Cold {
     }
     for observer in &c.observers {
         if header(g, observer.key).is_ok() {
-            shared_plan::local_structure_changed(rt, g, observer.key);
             g.cold[observer.key.index as usize]
                 .as_mut()
                 .unwrap()
@@ -228,7 +245,7 @@ fn detach_node(rt: &Runtime, g: &mut Graph, key: Key) -> Cold {
     c
 }
 // Mark the entire subtree unavailable before extraction or any callback.
-fn detach(rt: &Runtime, g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
+fn detach(g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
     let mut groups = Vec::new();
     for &root in roots {
         if owner(g, root).is_err() {
@@ -271,11 +288,7 @@ fn detach(rt: &Runtime, g: &mut Graph, roots: &[Key]) -> Vec<Retired> {
                     owner_mut(g, moved).unwrap().position = o.position;
                 }
             }
-            let nodes = o
-                .nodes
-                .iter()
-                .map(|&node| detach_node(rt, g, node))
-                .collect();
+            let nodes = o.nodes.iter().map(|&node| detach_node(g, node)).collect();
             retired.push(Retired { owner: o, nodes });
         }
     }
@@ -379,7 +392,7 @@ impl Runtime {
         if self.resolve_owner(h).is_err() {
             return Ok(());
         }
-        let retired = self.graph(|g| detach(self, g, &[h.key]));
+        let retired = self.graph(|g| detach(g, &[h.key]));
         self.drain_owners(retired)
     }
     pub(super) fn dispose_node(&self, key: Key) -> Result<()> {
@@ -387,8 +400,8 @@ impl Runtime {
         // Detach the node and its execution subtree before first cleanup.
         let (retired, c) = self.graph(|g| {
             g.hot[key.index as usize].alive = false;
-            let retired = scope.map(|s| detach(self, g, &[s])).unwrap_or_default();
-            let c = detach_node(self, g, key);
+            let retired = scope.map(|s| detach(g, &[s])).unwrap_or_default();
+            let c = detach_node(g, key);
             if let Ok(o) = owner_mut(g, c.owner) {
                 swap_remove_key(&mut o.nodes, key);
             }
@@ -409,6 +422,21 @@ impl Runtime {
         }
         error.map_or(Ok(()), Err)
     }
+    #[inline(never)]
+    pub(super) fn prepare_logical_execution(&self, g: &mut Graph, key: Key) -> Result<bool> {
+        let c = g.cold[key.index as usize].as_ref().unwrap();
+        if c.execution_owner.is_some() {
+            return Ok(false);
+        }
+        let (parent, epoch) = (c.owner, c.scope_epoch);
+        self.next_disposal_depth()?;
+        defer_execution(g, key, parent)?;
+        self.0.owner.set(None);
+        self.0
+            .pending_owner
+            .set(Some(PendingOwner { node: key, epoch }));
+        Ok(true)
+    }
     pub(super) fn prepare_execution(&self, key: Key) -> Result<bool> {
         self.next_disposal_depth()?;
         let (old, parent, epoch) = self.graph(|g| {
@@ -416,18 +444,7 @@ impl Runtime {
             let (old, parent, epoch) = (c.execution_owner, c.owner, c.scope_epoch);
             if old.is_none() {
                 // Same depth-overflow preflight as allocating a physical owner.
-                owner(g, parent)?
-                    .depth
-                    .checked_add(1)
-                    .ok_or(Error::DepthLimit)?;
-                let c = g.cold[key.index as usize].as_mut().unwrap();
-                if !c.scope_deferred {
-                    let position = owner(g, parent)?.children.len();
-                    owner_mut(g, parent)?.children.push(Child::Deferred(key));
-                    let c = g.cold[key.index as usize].as_mut().unwrap();
-                    c.scope_deferred = true;
-                    c.scope_position = position;
-                }
+                defer_execution(g, key, parent)?;
             }
             Ok((old, parent, epoch))
         })?;
@@ -468,7 +485,7 @@ impl Runtime {
                 // Retire the backlink before invoking cleanups: even an Err or
                 // panic must not leave a live node pointing at a dead owner.
                 self.graph(|g| g.cold[key.index as usize].as_mut().unwrap().execution_owner = None);
-                let retired = self.graph(|g| detach(self, g, &[old]));
+                let retired = self.graph(|g| detach(g, &[old]));
                 self.drain_owners(retired)?;
             }
             if self.graph(|g| header(g, key).is_err()) {
@@ -501,7 +518,7 @@ impl Runtime {
     pub(super) fn shutdown_owners(&self) -> Result<()> {
         let retired = self.graph(|g| {
             let roots = g.roots.iter().rev().copied().collect::<Vec<_>>();
-            detach(self, g, &roots)
+            detach(g, &roots)
         });
         self.drain_owners(retired)
     }
@@ -520,7 +537,6 @@ impl Runtime {
         let mut error = None;
         for mut r in retired {
             while let Some(mut callback) = r.owner.cleanups.pop() {
-                let _callback = shared_plan::Callback::enter(self);
                 match catch_unwind(AssertUnwindSafe(|| callback(self))) {
                     Ok(Ok(())) => (),
                     Ok(Err(e)) => {

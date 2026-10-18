@@ -21,37 +21,29 @@ mod conformance;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
 mod evaluation;
+mod fused;
 mod planning;
 #[cfg(test)]
 mod planning_tests;
 pub use planning::EvaluationStrategy;
-mod executable_plan;
 mod failures;
 mod notification;
 #[cfg(test)]
 mod optimization_tests;
-mod ordered;
 mod ownership;
 #[cfg(test)]
 mod production_ports;
 #[cfg(test)]
 mod production_support;
 mod scheduling;
-mod shared_plan;
 #[cfg(feature = "topology-diagnostics")]
 mod topology;
 #[cfg(feature = "diagnostics")]
 pub use diagnostics::*;
-#[cfg(feature = "diagnostics")]
-pub use executable_plan::ExecutablePlanSnapshot;
 pub use failures::RuntimeStatus;
 use failures::capability_error;
-#[cfg(feature = "diagnostics")]
-pub use ordered::{OrderedCounters, OrderedSnapshot};
 pub use ownership::{OwnerHandle, WeakRuntime};
 pub use scheduling::{FlushOptions, FlushOutcome, FlushReport};
-#[cfg(feature = "diagnostics")]
-pub use shared_plan::{SharedPlanCounters, SharedPlanSnapshot};
 #[cfg(feature = "topology-diagnostics")]
 pub use topology::{
     TopologyPlan, TopologySessionKind, TopologySnapshot, TopologyTrace, TraceRelation,
@@ -296,12 +288,8 @@ struct Inner {
     owner: Cell<Option<Key>>,
     pending_owner: Cell<Option<ownership::PendingOwner>>,
     frames: std::cell::RefCell<Vec<evaluation::Frame>>,
+    fused_frames: std::cell::RefCell<Vec<fused::Frame>>,
     strategy: EvaluationStrategy,
-    validation_frames: std::cell::RefCell<Vec<planning::Frame>>,
-    plan_epoch: Cell<Option<u64>>,
-    shared_plan: std::cell::RefCell<shared_plan::Storage>,
-    shared_frames: std::cell::RefCell<Vec<shared_plan::Frame>>,
-    ordered: std::cell::RefCell<ordered::Storage>,
     #[cfg(feature = "topology-diagnostics")]
     topology_enabled: Cell<bool>,
     #[cfg(feature = "topology-diagnostics")]
@@ -349,17 +337,7 @@ impl Runtime {
         if let Ok(mode) = std::env::var("TYPED_EVALUATION") {
             return Self::with_evaluation_strategy(match mode.as_str() {
                 "full" => EvaluationStrategy::FullFrames,
-                "light" => EvaluationStrategy::LightFrames,
                 "topological" => EvaluationStrategy::DemandDriven,
-                "shared" => EvaluationStrategy::SharedPlan,
-                "shared-dirty" => EvaluationStrategy::SharedPlanDirty,
-                "shared-opt" => EvaluationStrategy::SharedPlanOptimized,
-                "shared-dirty-opt" => EvaluationStrategy::SharedPlanDirtyOptimized,
-                "global" => EvaluationStrategy::GlobalPlan,
-                "global-dirty" => EvaluationStrategy::GlobalPlanDirty,
-                "local" => EvaluationStrategy::LocalPlan,
-                "local-dirty" => EvaluationStrategy::LocalPlanDirty,
-                "ordered" => EvaluationStrategy::OrderedDemand,
                 _ => panic!("unknown TYPED_EVALUATION: {mode}"),
             });
         }
@@ -398,12 +376,8 @@ impl Runtime {
             owner: Cell::new(None),
             pending_owner: Cell::new(None),
             frames: Default::default(),
+            fused_frames: Default::default(),
             strategy,
-            validation_frames: Default::default(),
-            plan_epoch: Cell::new(Some(0)),
-            shared_plan: Default::default(),
-            shared_frames: Default::default(),
-            ordered: Default::default(),
             #[cfg(feature = "topology-diagnostics")]
             topology_enabled: Cell::new(false),
             #[cfg(feature = "topology-diagnostics")]
@@ -476,7 +450,6 @@ impl Runtime {
         Ok(())
     }
     fn user<T>(&self, f: impl FnOnce() -> T) -> T {
-        let _callback = shared_plan::Callback::enter(self);
         match catch_unwind(AssertUnwindSafe(f)) {
             Ok(value) => value,
             Err(panic) => {
@@ -492,7 +465,6 @@ impl Runtime {
         }
         let _caps = Caps::enter(0);
         let _reader = ReaderRuntime::enter(None);
-        let _callback = shared_plan::Callback::enter(self);
         let before = self.failure_count();
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
             if self.failure_count() == before {
@@ -729,6 +701,7 @@ impl Runtime {
             if h.phase != EvaluationPhase::Idle || h.state != State::Clean || !h.initialized {
                 return Ok(None);
             }
+            let (revision, freshness) = (h.revision, h.freshness);
             let ptr = c.value.cast::<Typed<T>>();
             // SAFETY: type, generation, life, kind and initialization were
             // checked in this kernel. T: Copy runs no user code. No reference
@@ -741,7 +714,7 @@ impl Runtime {
                     .ok_or(Error::UninitializedValue)?
             };
             if track && let Some(reader) = self.0.reader.get() {
-                record_read(g, reader, handle.key)?;
+                record_resolved_read(g, reader, handle.key, revision, freshness)?;
             }
             #[cfg(feature = "diagnostics")]
             {
@@ -872,7 +845,6 @@ impl Runtime {
             if self.0.topology_enabled.get() {
                 self.0.topology.borrow_mut().changed(handle.key);
             }
-            shared_plan::global_changed(self, handle.key);
             mark(g, handle.key)
         });
         let _ = visits;
@@ -891,22 +863,7 @@ impl Runtime {
         let _topology = topology::begin_read(self, key);
         match self.0.strategy {
             EvaluationStrategy::FullFrames => evaluation::update(self, key),
-            EvaluationStrategy::LightFrames => planning::update::<false>(self, key),
-            EvaluationStrategy::DemandDriven => planning::update::<true>(self, key),
-            EvaluationStrategy::SharedPlan | EvaluationStrategy::SharedPlanDirty => {
-                shared_plan::update::<false, false, false>(self, key)
-            }
-            EvaluationStrategy::SharedPlanOptimized
-            | EvaluationStrategy::SharedPlanDirtyOptimized => {
-                shared_plan::update::<true, false, false>(self, key)
-            }
-            EvaluationStrategy::GlobalPlan | EvaluationStrategy::GlobalPlanDirty => {
-                shared_plan::update::<true, true, false>(self, key)
-            }
-            EvaluationStrategy::LocalPlan | EvaluationStrategy::LocalPlanDirty => {
-                shared_plan::update::<true, true, true>(self, key)
-            }
-            EvaluationStrategy::OrderedDemand => ordered::update(self, key),
+            EvaluationStrategy::DemandDriven => fused::update(self, key),
         }
     }
     fn reconcile(&self, key: Key) -> Result<()> {
@@ -969,8 +926,6 @@ impl Runtime {
             if old.len() != new.len()
                 || old.iter().zip(&new).any(|(a, b)| !a.live || a.key != b.key)
             {
-                shared_plan::local_structure_changed(self, g, key);
-                ordered::structure_changed(self, key, new.len());
                 for source in &old {
                     unlink(g, *source, key);
                 }
@@ -1003,14 +958,6 @@ impl Runtime {
         #[cfg(feature = "topology-diagnostics")]
         if result.is_ok() && self.0.topology_enabled.get() {
             topology::completed(self, key);
-        }
-        if result.is_ok()
-            && matches!(
-                self.0.strategy,
-                EvaluationStrategy::GlobalPlan | EvaluationStrategy::GlobalPlanDirty
-            )
-        {
-            shared_plan::invalidate_global(self);
         }
         result
     }
@@ -1180,6 +1127,17 @@ impl Runtime {
 fn record_read(g: &mut Graph, reader: Key, source: Key) -> Result<()> {
     let h = header(g, source)?;
     let (revision, freshness) = (h.revision, h.freshness);
+    record_resolved_read(g, reader, source, revision, freshness)
+}
+// The source was resolved in this same callback-free graph kernel. The reader
+// still needs its OWN generational check: a callback may have disposed it.
+fn record_resolved_read(
+    g: &mut Graph,
+    reader: Key,
+    source: Key,
+    revision: u64,
+    freshness: u64,
+) -> Result<()> {
     if header(g, reader).is_err() {
         return Ok(());
     }
@@ -1280,10 +1238,7 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
     // SAFETY: descriptor is monomorphized for the pinned allocation's T.
     // Take the callback without retaining a cell reference across user code.
     let mut compute = unsafe { (&mut *ptr.as_ref().compute.get()).take().expect("compute") };
-    let mut outcome = {
-        let _callback = shared_plan::Callback::enter(rt);
-        catch_unwind(AssertUnwindSafe(|| compute(rt)))
-    };
+    let mut outcome = { catch_unwind(AssertUnwindSafe(|| compute(rt))) };
     match &outcome {
         Ok(Err(e)) => rt.record_failure(*e),
         Err(_) => rt.record_failure(Error::Panic),
@@ -1371,21 +1326,6 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
         };
         rt.graph(|g| {
             header_mut(g, key).unwrap().revision = revision;
-            if matches!(
-                rt.0.strategy,
-                EvaluationStrategy::SharedPlanDirty | EvaluationStrategy::SharedPlanDirtyOptimized
-            ) {
-                shared_plan::published(g, key);
-            }
-            if rt.0.strategy == EvaluationStrategy::GlobalPlanDirty {
-                shared_plan::global_published(rt, g, key);
-            }
-            if rt.0.strategy == EvaluationStrategy::OrderedDemand {
-                shared_plan::published(g, key);
-            }
-            if rt.0.strategy == EvaluationStrategy::LocalPlanDirty {
-                shared_plan::local_published(rt, g, key);
-            }
         });
         rt.retire(old);
     }

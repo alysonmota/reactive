@@ -49,19 +49,9 @@ unsafe impl GlobalAlloc for Allocator {
 }
 #[global_allocator]
 static ALLOCATOR: Allocator = Allocator;
-const MODES: [EvaluationStrategy; 12] = [
+const MODES: [EvaluationStrategy; 2] = [
     EvaluationStrategy::FullFrames,
-    EvaluationStrategy::LightFrames,
     EvaluationStrategy::DemandDriven,
-    EvaluationStrategy::SharedPlan,
-    EvaluationStrategy::SharedPlanDirty,
-    EvaluationStrategy::SharedPlanOptimized,
-    EvaluationStrategy::SharedPlanDirtyOptimized,
-    EvaluationStrategy::GlobalPlan,
-    EvaluationStrategy::GlobalPlanDirty,
-    EvaluationStrategy::LocalPlan,
-    EvaluationStrategy::LocalPlanDirty,
-    EvaluationStrategy::OrderedDemand,
 ];
 
 #[test]

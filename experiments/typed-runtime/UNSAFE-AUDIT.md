@@ -7,6 +7,92 @@
 
 ## Subsequent optimization review
 
+### Current follow-up: logical prepare inside the fused kernel
+
+The measured outlined variant was reapplied byte-identically. Demand prepares
+an unmaterialized execution scope in the same guarded kernel that selected
+Execute, after applying that frame's capabilities/purity. A scalar prepared
+flag skips the separate prepare call. Disposal-depth and parent-depth checks,
+scope epoch and Deferred registration remain. Physical scopes still use the
+established prepare_execution/cleanup path; descriptors are resolved after
+that boundary. No graph/frame reference crosses callbacks and no generation
+certificate is weakened. The shared registration helper is inline(always);
+the logical prepare method is inline(never), matching the measured variant.
+Evidence and validation limits: `../../benches/LOGICAL-PREPARE.md`.
+
+### Previous follow-up: successful Session Drop and resolved-source tracking
+
+`fused::Session::finished` is set only after run returns Ok; normal Drop skips
+the empty-arena graph kernel and restores Context. Error/unwind still check
+every retired frame generation and recover phases/reads. `thread::panicking`
+is cfg-gated to unwind builds. No generation certificate or callback boundary
+was weakened. The temporary noinline next probe is NOT in the final source.
+
+The Copy read kernel already validates source type, life, kind, phase and
+initialization. It now passes the resolved revision/freshness to tracking in
+that SAME guarded kernel instead of looking up the source twice. Tracking
+still resolves the reader generation, including after reader self-disposal.
+No pointer/reference survives a callback or tracking allocation; the Copy
+value is extracted before tracking grows its Vec. Slow reads keep source
+resolution. No new unsafe primitive. Isolated measurements and validation:
+`../../benches/SESSION-COST.md`.
+
+### Previous revision: compact DemandDriven and callback-free certificates
+
+Only FullFrames (still the default) and DemandDriven remain; LightFrames was
+removed. `evaluation.rs` is byte-identical to the sealed pre-change control.
+`fused.rs` REPLACES the previous DemandDriven interpreter; it is not an extra
+selectable executor or executable plan. Its scalar frame is 32 B on 64-bit
+targets, with a usize cursor and one Context saved per nested Session.
+
+The existing protected typed execution/cleanup/reconciliation protocol remains.
+No reference into Graph, frames, sources or typed values crosses user code.
+Source Key generations are always checked. Only an already-resolved reader's
+redundant header checks are replaced by bounds-checked indexing. A source gate
+may pass a resolved Key directly to push inside the SAME guarded kernel.
+
+A session-local u64 epoch invalidates suspended-frame certificates after every
+successful execute (including nested reads, cleanup and comparator callbacks).
+On resumption each stale frame revalidates its full Key before any indexed
+access. Error/unwind and immediate callback-return pops ALWAYS revalidate,
+even if execution failed before advancing the epoch; overflow is an error.
+These are frame certificates, not removed plan/cache maintenance epochs.
+
+Waiting state is a bool: the committed source ordinal is read again after
+descent. Checking readers cannot reconcile; disposal preserves Key/revision
+at that ordinal and only tombstones it. The old source generation is checked
+even for a tombstone, preserving the checked control's error behavior. There
+is no unsafe indexing or added unsafe primitive.
+
+Directed tests cover self-disposal and differently typed slot reuse on callback
+success/error/unwind, provisional-source disposal/reuse, and synthetic ancestor
+generation replacement while suspended. The synthetic case is NOT an allowed
+capability of pure memo callbacks. Evidence and remaining limits are recorded
+in `../../benches/FUSED-VALIDATION.md`; this is not independent unsafe review.
+
+### Previous revision: remove executable plans; retain three frame controls
+
+Shared/Global/Local/Ordered evaluators and their Dirty variants, instruction
+storage, ranks, callback epochs and maintenance hooks have been removed.
+The sections describing them below are HISTORICAL. No unsafe primitive or
+capability/phase/generation/cleanup check was removed. Their Callback guard
+only invalidated plan epochs: it was not the protected resource boundary.
+The real unwind/poison, TLS capability, notification, allocator reentry and
+ownership guards remain. FullFrames is still the default; LightFrames and
+DemandDriven retain their unchanged frame algorithms. No immediate Dirty
+publication optimization was retained. Optional topology-diagnostics remains
+a shadow observer, never an evaluator or normal-build allocation.
+
+Plan-only snapshot APIs and 34 tests specific to retired interpreters were
+removed with their implementations. General production/typed contract tests,
+planning differential tests, safety/audit/ownership tests and the reference
+model remain; three supported modes run the same suites. Current evidence:
+all-features/default workspace suites in all three modes, warning-free Clippy,
+4 differential planning tests (all three modes) and 32 audit tests under Miri.
+Audit Miri selects DemandDriven, not every port/model under every strategy;
+this is not independent unsafe review or blanket proof of absence of UB.
+Hashes/boundaries and abort-only profiling evidence: `../../benches/WALK-PHASES.md`.
+
 ### OrderedDemand: compiled postorder gate interpreter (ordered-v2)
 
 This independent strategy does NOT call evaluation::update, planning::update,

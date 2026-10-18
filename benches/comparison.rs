@@ -425,6 +425,10 @@ fn graphs<E: Engine + 'static>(c: &mut Criterion) {
 }
 
 fn comparison(c: &mut Criterion) {
+    #[cfg(not(panic = "abort"))]
+    if std::env::var_os("REACTIVE_REQUIRE_ABORT").is_some() {
+        panic!("benchmark baseline requires effective panic=abort");
+    }
     if std::env::var_os("REACTIVE_CHAIN_INVESTIGATION").is_some() {
         chain::benchmarks(c);
         return;
@@ -477,6 +481,10 @@ fn cut<E: Engine + 'static>(c: &mut Criterion) {
 pub(crate) fn p1p2_memory(
     allocator: &stats_alloc::StatsAlloc<std::alloc::System>,
 ) -> serde_json::Value {
+    #[cfg(not(panic = "abort"))]
+    if std::env::var_os("REACTIVE_REQUIRE_ABORT").is_some() {
+        panic!("benchmark baseline requires effective panic=abort");
+    }
     fn measure<E: Engine + 'static>(
         allocator: &stats_alloc::StatsAlloc<std::alloc::System>,
         shape: Shape,

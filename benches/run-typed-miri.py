@@ -12,10 +12,7 @@ import time
 ROOT=Path(__file__).resolve().parent.parent
 LOG=ROOT/'benches/.log'
 CASES={
- 'ordered':['ordered::tests::'],
- 'local':['executable_plan::local_tests::'],
- 'global':['executable_plan::tests::'],
- 'shared':['shared_plan::tests::'],
+ 'fused':['fused::tests::'],
  'topology':['topology::tests::'],
  'evaluators':['--','--skip','production_ports::','--skip','individual_source_disposals_keep_indices_release_values_and_reconcile_once','--skip','repeated_create_dispose_without_flush_reuses_slots_and_drops_all_captures','--skip','randomized_reads_writes_branches_flush_and_disposal_match_reference_model'],
  'planning':['planning_tests::'],
@@ -42,7 +39,7 @@ def main():
     flags='-Zmiri-env-forward=TYPED_MODEL_SEED_START -Zmiri-env-forward=TYPED_MODEL_SEED_END'
     if a.case=='model':env['MIRIFLAGS']=flags
     if 'TYPED_EVALUATION' in env:
-        assert env['TYPED_EVALUATION'] in ['full','light','topological','shared','shared-dirty','shared-opt','shared-dirty-opt','global','global-dirty','local','local-dirty','ordered']
+        assert env['TYPED_EVALUATION'] in ['full','topological']
         env['MIRIFLAGS']=(env.get('MIRIFLAGS','')+' -Zmiri-env-forward=TYPED_EVALUATION').strip()
     env['TYPED_MODEL_SEED_START']=str(a.seed_start);env['TYPED_MODEL_SEED_END']=str(a.seed_end)
     command=['taskset','-c',str(a.cpu),'cargo','+nightly-2026-08-29','miri','test','--locked','--profile','fast-dev','-p','typed-runtime-prototype','--all-features']+CASES[a.case]

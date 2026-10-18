@@ -1,19 +1,9 @@
 use super::*;
 use production_support::{effect, flush, memo, signal};
 
-const STRATEGIES: [EvaluationStrategy; 12] = [
+const STRATEGIES: [EvaluationStrategy; 2] = [
     EvaluationStrategy::FullFrames,
-    EvaluationStrategy::LightFrames,
     EvaluationStrategy::DemandDriven,
-    EvaluationStrategy::SharedPlan,
-    EvaluationStrategy::SharedPlanDirty,
-    EvaluationStrategy::SharedPlanOptimized,
-    EvaluationStrategy::SharedPlanDirtyOptimized,
-    EvaluationStrategy::GlobalPlan,
-    EvaluationStrategy::GlobalPlanDirty,
-    EvaluationStrategy::LocalPlan,
-    EvaluationStrategy::LocalPlanDirty,
-    EvaluationStrategy::OrderedDemand,
 ];
 fn runtime(strategy: EvaluationStrategy) -> (Runtime, OwnerHandle) {
     let r = Runtime::with_evaluation_strategy(strategy);
@@ -26,8 +16,7 @@ fn restored(r: &Runtime) {
     assert_eq!(r.0.owner.get(), None);
     assert_eq!(r.0.pending_owner.get(), None);
     assert!(r.0.frames.borrow().is_empty());
-    assert!(r.0.validation_frames.borrow().is_empty());
-    assert!(r.0.shared_frames.borrow().is_empty());
+    assert!(r.0.fused_frames.borrow().is_empty());
     assert_eq!(CAPS.get(), ALL);
     assert!(!PURE.get());
     assert_eq!(READER_RUNTIME.get(), None);
@@ -115,7 +104,6 @@ fn frontier_preserves_postorder_equality_cut_and_effect_order() {
         traces.push(log.borrow().clone());
     }
     assert_eq!(traces[0], traces[1]);
-    assert_eq!(traces[0], traces[2]);
 }
 
 #[test]

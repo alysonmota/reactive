@@ -27,8 +27,16 @@ def digest(path):
 
 
 def build(bench, root, label, env, package_root=ROOT, work=False):
+    # Cargo ignores profile.panic for benches, even with harness=false.
+    # Force the final compiler flags, including dependencies, and require the
+    # benchmark to verify cfg(panic) before collecting measurements.
+    if 'CARGO_ENCODED_RUSTFLAGS' in env:
+        env['CARGO_ENCODED_RUSTFLAGS'] += '\x1f-C\x1fpanic=abort'
+    else:
+        env['RUSTFLAGS'] = (env.get('RUSTFLAGS', '') + ' -C panic=abort').strip()
+    env['REACTIVE_REQUIRE_ABORT'] = '1'
     with (root / f"build-{bench}.log").open("w") as stdout:
-        command = ["cargo", "bench", "--locked", "--profile", "release", "--no-default-features",
+        command = ["cargo", "bench", "--locked", "--profile", "bench-abort", "--no-default-features",
                    "--bench", bench, "--no-run", "--message-format=json"]
         if work:
             command += ["--features", "diagnostics,typed-runtime-prototype/diagnostics"]
@@ -53,7 +61,7 @@ def main():
     p.add_argument("--mode", choices=["pilot", "full", "sham", "memory", "work", "baseline", "matrix"], default="pilot")
     p.add_argument("--cpu", type=int, default=2)
     p.add_argument("--contracts", action="store_true",help="Include owner-resource and writable-effect fixtures")
-    p.add_argument('--evaluation', choices=['full','light','topological','shared','shared-dirty','shared-opt','shared-dirty-opt','global','global-dirty','local','local-dirty','ordered'], default='full')
+    p.add_argument('--evaluation', choices=['full','topological'], default='full')
     args = p.parse_args()
     assert args.label and all(c.isalnum() or c in "-_" for c in args.label)
     root = LOG / "runs" / args.label
@@ -79,7 +87,8 @@ def main():
     bench = "p1p2_memory" if args.mode in ["memory", "work"] else "comparison"
     executable, binary = build(bench, root, args.label, env, package_root, args.mode == "work")
     metadata = {"label": args.label, "mode": args.mode, "binary": binary, "source_sha256": source,
-                "cpu": args.cpu, "system": platform.uname()._asdict(),
+                 "cpu": args.cpu, "system": platform.uname()._asdict(), "panic": "abort",
+                 "rustflags": env.get('RUSTFLAGS'), "encoded_rustflags": env.get('CARGO_ENCODED_RUSTFLAGS'),
                 "rustc": subprocess.check_output(["rustc", "-Vv"], text=True),
                 "cargo_home": os.environ.get("CARGO_HOME"), "runs": [],
                  "contracts":args.contracts,"evaluation":args.evaluation,"driver_source":Path(__file__).read_text(),
