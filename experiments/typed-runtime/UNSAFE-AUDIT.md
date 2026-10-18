@@ -466,11 +466,30 @@ older Miri source hashes do not attest this revision.
   held across cleanup or compute. All arena growth occurs inside `graph`, so
   allocator reentry is rejected before another exclusive graph borrow.
 - Descriptors are fetched only after cleanup and generation/life revalidation.
+  Demand's logical-prepare path may now carry the resolved raw executable in
+  Action: preparation, resolution and phase transition share ONE callback-free
+  kernel. No reference escapes. Physical preparation still resolves after all
+  cleanup callbacks. Error/unwind recovery retains checked generational pop.
   `execute<T>` keeps the existing callback extraction, self-disposal/reuse
   checks and first-read validation. `Session::pop` replaces the old Evaluation
   guard: it restores owner, logical owner, reader, depth, cumulative TLS caps,
   purity and runtime identity, and only resets phase/failure for the SAME key.
   Logical evaluation depth remains bounded at 512 even with a flat Rust stack.
+  Demand checks every push but publishes depth only before prepare/Execute and
+  restores captured depth on exit. The callback-free fused descent/pop loop has
+  no observable user boundary in between. READ is checked once per nonempty
+  tick; empty completion after shutdown does not add a new status error.
+  All descendant frames are memo READ/pure (effects are rejected as sources),
+  allowing cumulative caps to be derived from Session Context rather than parent
+  frame reloads. validation defers owner/pending restoration until Session exit;
+  each prepare still establishes its callback's own execution owner context.
+  The life check and first-read preflight now share a kernel, but preflight's
+  Result is saved: compute is restored and the candidate Protected before that
+  Result is propagated. Compute Err/panic and status-check precedence remain.
+  No first-read/stability certificate survives equals or retired-value Drop:
+  the attempted shortcut failed comparator-freshness fault injection and was
+  removed. Final source approval is directed Miri (13 tests per mode), not a
+  complete model/ports run or independent unsafe review; see HYPOTHESIS-MATRIX.
 - Deferred scopes are scalar `(computation Key, scope_epoch)` contexts, not
   public owner handles and not pointers. Materialization validates both before
   allocating/linking a physical owner. No identity is exposed before that
@@ -482,9 +501,12 @@ older Miri source hashes do not attest this revision.
   replaces that entry in place. Deferred sibling backpositions are updated on
   swap-remove. This preserves physical-sibling cleanup order even when scopes
   are first observed in a different order, without allocating full owners.
-- Stable reconciliation validates every source/revision/freshness before
-  updating committed read revisions. It preserves existing observer indices
-  and the committed buffer. Tombstones, dead generations, changed order and
+- Stable reconciliation validates each source's full Key/revision/freshness
+  while updating matched committed revisions in one callback-free pass. A
+  later mismatch falls back to replacing sources with reads: unlink depends
+  only on Key/backlink ordinals, not the revisions already copied. No partial
+  update is exposed to user code. It preserves existing observer indices
+  and the committed buffer when stable. Tombstones, dead generations, changed order and
   abandoned sources still use the generic reconciliation path. No callbacks
   execute during either path; writable effects still use first-read revisions
   to schedule the required follow-up evaluation.
@@ -583,7 +605,7 @@ test/verification-only kernel guard is now mandatory in normal builds.
 | `execute<T>`: extract compute | Descriptor pairing; Option<Compute<T>> taken before callback, with no retained `&Typed`/`&mut` | Self-disposal, shutdown and recycled-type tests |
 | `execute<T>`: restore compute | Check original Key generation/life after callback. If dead, retire local compute under mask 0 and never dereference the old pointer | `disposing_self_or_owner_and_reusing_node_as_signal_never_restores_old_closure`, `provisional_reads_survive_self_disposal_growth_and_slot_type_reuse` |
 | `execute<T>`: compare candidate | Original allocation is live; memo first-read revisions/freshness validated before publication; pure mask 0 across user equals | Stale-read injection, comparator failure/old value/edge tests |
-| `execute<T>`: alternate-slot publication | Compare references ended; revision checked; no mutation-authorized callback between life validation and write; old value extracted before Drop | Two-slot reuse, equality-cut retention, destructor panic and drop-count tests |
+| `execute<T>`: alternate-slot publication | Compare references ended; full Key revalidated and revision checked before slot mutation in one callback-free graph kernel; alternate slot empty; old value returned out of kernel before protected Drop | Two-slot reuse, equality-cut retention, destructor panic/drop-count tests, memo revision overflow preserves current slot |
 | `destroy<T>`: `Box::from_raw` | Exactly one Cold owns each Box; detach takes the Cold once. Final drop takes remaining colds; disposed entries are None. Descriptor and allocation share T/alignment | Slot retirement/reuse, repeated disposal, over-aligned/ZST types, allocation growth, full teardown tests |
 | `Owned::drop`: descriptor destroy | Same pairing as creation; detached Cold is moved, not cloned; unwind does not put it back into graph. Values, compute and comparator are extracted/drained independently | Multiple destructor/cleanup failure tests, original panic preservation, net-zero allocator measurements |
 

@@ -44,8 +44,6 @@ impl Context {
     }
     fn validation(self, rt: &Runtime) {
         rt.0.reader.set(None);
-        rt.0.owner.set(self.owner);
-        rt.0.pending_owner.set(self.pending_owner);
         CAPS.set(self.caps & READ);
         PURE.set(true);
         READER_RUNTIME.set(Some(rt.0.id));
@@ -60,10 +58,12 @@ struct Session<'a> {
     finished: bool,
 }
 enum Action {
-    Descend(Key),
-    Execute(Key, Kind, bool),
-    Done,
+    Execute(Key, Kind, Option<Executable>),
     Finished,
+}
+struct Executable {
+    value: NonNull<()>,
+    execute: unsafe fn(NonNull<()>, &Runtime, Key) -> Result<bool>,
 }
 pub(super) fn update(rt: &Runtime, key: Key) -> Result<()> {
     rt.check(READ)?;
@@ -121,12 +121,8 @@ impl Session<'_> {
             return Err(Error::Depth);
         }
         let kind = h.kind;
-        let (caps, pure) = if frames.len() > self.base {
-            let p = frames.last().unwrap();
-            (p.caps, p.pure)
-        } else {
-            (self.context.caps, self.context.pure)
-        };
+        // Sources cannot be effects, so descendants are pure READ frames.
+        let (caps, pure) = (self.context.caps, self.context.pure);
         frames.push(Frame {
             key,
             cursor: 0,
@@ -142,7 +138,6 @@ impl Session<'_> {
             waiting: false,
         });
         g.hot[key.index as usize].phase = EvaluationPhase::Checking;
-        self.rt.0.depth.set(depth + 1);
         #[cfg(feature = "diagnostics")]
         self.rt.0.diagnostic.borrow_mut().active.push(CycleFrame {
             node: key.into(),
@@ -150,92 +145,111 @@ impl Session<'_> {
         });
         Ok(true)
     }
-    fn next(&self, g: &mut Graph, frames: &mut [Frame]) -> Result<Action> {
-        self.rt.check(READ)?;
-        let f = frames.last_mut().unwrap();
-        let key = f.key;
-        // A successful execute invalidates EVERY suspended certificate by one
-        // scalar increment. Revalidate lazily on return, not by scanning frames.
-        if f.verified != self.epoch {
-            if header(g, key).is_err() {
-                return Ok(Action::Done);
+    fn next(&mut self, g: &mut Graph, frames: &mut Vec<Frame>) -> Result<Action> {
+        'walk: loop {
+            if frames.len() == self.base {
+                return Ok(Action::Finished);
             }
-            f.verified = self.epoch;
-        }
-        if std::mem::take(&mut f.waiting) {
-            // A Checking reader cannot reconcile its committed source vector.
-            // Disposal tombstones the same ordinal, preserving Key/revision;
-            // backlink repair changes only observer_index. Re-read, never keep
-            // Source or a slice/reference across callbacks. Resolve generation
-            // even for a tombstone here, matching the checked control's error.
-            let source = *g.cold[key.index as usize]
-                .as_ref()
-                .unwrap()
-                .sources
-                .get(f.cursor)
-                .ok_or(Error::Invariant)?;
-            if !observe_verified(g, key, source)? {
-                f.cursor += 1;
+            let frame_count = frames.len();
+            let f = frames.last_mut().unwrap();
+            let key = f.key;
+            // A successful execute invalidates EVERY suspended certificate by one
+            // scalar increment. Revalidate lazily on return, not by scanning frames.
+            if f.verified != self.epoch {
+                if header(g, key).is_err() {
+                    self.pop(g, frames, true);
+                    continue 'walk;
+                }
+                f.verified = self.epoch;
             }
-        }
-        loop {
-            let h = &g.hot[key.index as usize];
-            if h.state == State::Dirty || !h.initialized {
-                break;
+            if std::mem::take(&mut f.waiting) {
+                // A Checking reader cannot reconcile its committed source vector.
+                // Disposal tombstones the same ordinal, preserving Key/revision;
+                // backlink repair changes only observer_index. Re-read, never keep
+                // Source or a slice/reference across callbacks. Resolve generation
+                // even for a tombstone here, matching the checked control's error.
+                let source = *g.cold[key.index as usize]
+                    .as_ref()
+                    .unwrap()
+                    .sources
+                    .get(f.cursor)
+                    .ok_or(Error::Invariant)?;
+                if !observe_verified(g, key, source)? {
+                    f.cursor += 1;
+                }
             }
-            let source = g.cold[key.index as usize]
-                .as_ref()
-                .unwrap()
-                .sources
-                .get(f.cursor)
-                .copied();
-            let Some(source) = source else {
-                break;
-            };
-            #[cfg(feature = "diagnostics")]
-            {
-                g.work.source_checks = g.work.source_checks.saturating_add(1);
-            }
-            if !source.live {
-                g.hot[key.index as usize].state = State::Dirty;
-                break;
-            }
-            let h = header(g, source.key)?;
-            if h.kind == Kind::Effect {
-                return Err(Error::TypeMismatch);
-            }
-            if h.phase == EvaluationPhase::Idle && h.state == State::Clean && h.initialized {
-                let revision = h.revision;
-                if changed(g, key, revision, source.revision)? {
+            loop {
+                let h = &g.hot[key.index as usize];
+                if h.state == State::Dirty || !h.initialized {
                     break;
                 }
-                f.cursor += 1;
-            } else {
-                f.waiting = true;
-                return Ok(Action::Descend(source.key));
+                let source = g.cold[key.index as usize]
+                    .as_ref()
+                    .unwrap()
+                    .sources
+                    .get(f.cursor)
+                    .copied();
+                let Some(source) = source else {
+                    break;
+                };
+                #[cfg(feature = "diagnostics")]
+                {
+                    g.work.source_checks = g.work.source_checks.saturating_add(1);
+                }
+                if !source.live {
+                    g.hot[key.index as usize].state = State::Dirty;
+                    break;
+                }
+                let h = header(g, source.key)?;
+                if h.kind == Kind::Effect {
+                    return Err(Error::TypeMismatch);
+                }
+                if h.phase == EvaluationPhase::Idle && h.state == State::Clean && h.initialized {
+                    let revision = h.revision;
+                    if changed(g, key, revision, source.revision)? {
+                        break;
+                    }
+                    f.cursor += 1;
+                } else {
+                    f.waiting = true;
+                    self.push(g, frames, source.key, true)?;
+                    continue 'walk;
+                }
             }
+            let h = &mut g.hot[key.index as usize];
+            if h.state != State::Dirty && h.initialized {
+                h.state = State::Clean;
+                self.pop(g, frames, true);
+                continue 'walk;
+            }
+            let c = g.cold[key.index as usize].as_mut().unwrap();
+            c.scope_epoch = c.scope_epoch.checked_add(1).ok_or(Error::Exhausted)?;
+            c.reads.clear();
+            c.tracking_prefix = true;
+            g.hot[key.index as usize].phase = EvaluationPhase::Cleaning;
+            #[cfg(feature = "diagnostics")]
+            if let Some(f) = self.rt.0.diagnostic.borrow_mut().active.last_mut() {
+                f.phase = EvaluationPhase::Cleaning;
+            }
+            // Match the established execution context BEFORE preparing a scope,
+            // including allocations on first logical registration. No callback or
+            // unchecked Key crosses the transition out of this graph kernel.
+            // Publish logical depth before prepare can reach physical cleanup.
+            // Every push still checks the logical limit, including depth 512.
+            self.rt
+                .0
+                .depth
+                .set(self.context.depth + frame_count - self.base);
+            CAPS.set(f.caps);
+            PURE.set(f.pure);
+            let prepared = self.rt.prepare_logical_execution(g, key)?;
+            let executable = if prepared {
+                self.resolve_executable(g, key, f.kind, true)
+            } else {
+                None
+            };
+            return Ok(Action::Execute(key, f.kind, executable));
         }
-        let h = &mut g.hot[key.index as usize];
-        if h.state != State::Dirty && h.initialized {
-            h.state = State::Clean;
-            return Ok(Action::Done);
-        }
-        let c = g.cold[key.index as usize].as_mut().unwrap();
-        c.scope_epoch = c.scope_epoch.checked_add(1).ok_or(Error::Exhausted)?;
-        c.reads.clear();
-        c.tracking_prefix = true;
-        g.hot[key.index as usize].phase = EvaluationPhase::Cleaning;
-        #[cfg(feature = "diagnostics")]
-        if let Some(f) = self.rt.0.diagnostic.borrow_mut().active.last_mut() {
-            f.phase = EvaluationPhase::Cleaning;
-        }
-        // Match the established execution context BEFORE preparing a scope,
-        // including allocations on first logical registration. No callback or
-        // unchecked Key crosses the transition out of this graph kernel.
-        CAPS.set(f.caps);
-        PURE.set(f.pure);
-        let prepared = self.rt.prepare_logical_execution(g, key)?;
-        Ok(Action::Execute(key, f.kind, prepared))
     }
     fn pop(&self, g: &mut Graph, frames: &mut Vec<Frame>, trust: bool) {
         let f = frames.pop().unwrap();
@@ -252,10 +266,6 @@ impl Session<'_> {
                 c.tracking_prefix = true;
             }
         }
-        self.rt
-            .0
-            .depth
-            .set(self.context.depth + frames.len() - self.base);
         #[cfg(feature = "diagnostics")]
         {
             self.rt.0.diagnostic.borrow_mut().active.pop();
@@ -268,19 +278,12 @@ impl Session<'_> {
                 self.context.validation(self.rt);
                 self.pop(g, &mut frames, false);
             }
-            loop {
-                if frames.len() == self.base {
-                    return Ok(Action::Finished);
-                }
-                let action = self.next(g, &mut frames)?;
-                match action {
-                    Action::Descend(key) => {
-                        self.push(g, &mut frames, key, true)?;
-                    }
-                    Action::Done => self.pop(g, &mut frames, true),
-                    ready => return Ok(ready),
-                }
+            // No status/caps mutation within this callback-free walk. Empty
+            // completion must succeed even after shutdown inside an effect.
+            if frames.len() != self.base {
+                self.rt.check(READ)?;
             }
+            self.next(g, &mut frames)
         })
     }
     fn run(&mut self, key: Key) -> Result<()> {
@@ -294,9 +297,6 @@ impl Session<'_> {
         loop {
             match self.tick(completed)? {
                 Action::Finished => return Ok(()),
-                Action::Descend(_) | Action::Done => {
-                    unreachable!("tick consumes callback-free transitions")
-                }
                 Action::Execute(key, kind, prepared) => {
                     self.execute(key, kind, prepared)?;
                     self.epoch = self.epoch.checked_add(1).ok_or(Error::Exhausted)?;
@@ -307,32 +307,18 @@ impl Session<'_> {
     }
     // FullFrames' established execution protocol: no per-callback Context
     // capture/Restore and no additional interpreter beneath the fused tick.
-    fn execute(&self, key: Key, kind: Kind, prepared: bool) -> Result<()> {
+    fn execute(&self, key: Key, kind: Kind, prepared: Option<Executable>) -> Result<()> {
         let rt = self.rt;
-        if !prepared && !rt.prepare_execution(key)? {
-            return Ok(());
-        }
-        let executable = rt.graph(|g| {
-            if header(g, key).is_err() {
-                return None;
-            }
-            header_mut(g, key).unwrap().phase = EvaluationPhase::Executing;
-            #[cfg(feature = "diagnostics")]
-            {
-                if let Some(f) = rt.0.diagnostic.borrow_mut().active.last_mut() {
-                    f.phase = EvaluationPhase::Executing;
+        let executable = match prepared {
+            Some(executable) => Some(executable),
+            None => {
+                if !rt.prepare_execution(key)? {
+                    return Ok(());
                 }
-                match kind {
-                    Kind::Effect => {
-                        g.work.effect_executions = g.work.effect_executions.saturating_add(1)
-                    }
-                    _ => g.work.memo_executions = g.work.memo_executions.saturating_add(1),
-                }
+                rt.graph(|g| self.resolve_executable(g, key, kind, false))
             }
-            let c = g.cold[key.index as usize].as_ref().unwrap();
-            Some((c.value, c.descriptor.execute))
-        });
-        if let Some((value, execute)) = executable {
+        };
+        if let Some(Executable { value, execute }) = executable {
             rt.0.reader.set(Some(key));
             if kind == Kind::Effect {
                 rt.0.executions.set(
@@ -352,6 +338,39 @@ impl Session<'_> {
             }
         }
         Ok(())
+    }
+    // known only crosses callback-free logical preparation; physical cleanup
+    // always takes full resolution after its callbacks have finished.
+    fn resolve_executable(
+        &self,
+        g: &mut Graph,
+        key: Key,
+        kind: Kind,
+        known: bool,
+    ) -> Option<Executable> {
+        if !known && header(g, key).is_err() {
+            return None;
+        }
+        g.hot[key.index as usize].phase = EvaluationPhase::Executing;
+        #[cfg(feature = "diagnostics")]
+        {
+            if let Some(f) = self.rt.0.diagnostic.borrow_mut().active.last_mut() {
+                f.phase = EvaluationPhase::Executing;
+            }
+            match kind {
+                Kind::Effect => {
+                    g.work.effect_executions = g.work.effect_executions.saturating_add(1)
+                }
+                _ => g.work.memo_executions = g.work.memo_executions.saturating_add(1),
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = kind;
+        let c = g.cold[key.index as usize].as_ref().unwrap();
+        Some(Executable {
+            value: c.value,
+            execute: c.descriptor.execute,
+        })
     }
 }
 impl Drop for Session<'_> {

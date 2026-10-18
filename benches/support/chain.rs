@@ -1,4 +1,4 @@
-use super::{Engine, Graph, Leptos, Local, Shape, Sycamore};
+use super::{CallbackView, Engine, Graph, Leptos, Local, Shape, Sycamore};
 #[path = "fixture.rs"]
 mod fixture;
 use criterion::{BenchmarkId, Criterion};

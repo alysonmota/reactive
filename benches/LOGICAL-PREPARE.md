@@ -1,9 +1,13 @@
 # Prepare lógico fundido: variante separada mantida
 
+> Snapshot outlined: [CALLSITE-WALK.md](CALLSITE-WALK.md).
+> Primeiras fusões: [KERNEL-ABLATIONS.md](KERNEL-ABLATIONS.md).
+> Fonte atual e ablações completas: [HYPOTHESIS-MATRIX.md](HYPOTHESIS-MATRIX.md).
+
 ## Decisão
 
 A variante `logical-prepare-outlined` foi reaplicada por solicitação do usuário.
-Todos os arquivos Rust coincidem byte a byte com esse snapshot medido. Ela
+Na reaplicação, todos os arquivos Rust coincidiam com esse snapshot medido. Ela
 mantém Drop + tracking e acrescenta prepare lógico no kernel do Demand,
 com `defer_execution` inline(always) e `prepare_logical_execution` inline(never).
 FullFrames continua default; sem commit ou push.
@@ -52,11 +56,14 @@ variante totalmente inline. Não houve comparação nativa pareada antes/depois
 desta ablação; a coleta atual contra referências está abaixo. A dependência do inlining fica explícita nos
 atributos e nos snapshots, não como motivo suficiente para rejeição.
 
-## Tempo atual contra referências
+## Tempo do checkpoint outlined contra referências
 
 `current-outlined-references.json`: um mesmo executável abort, CPU 2, cinco
 modos em ordem simétrica e sua inversa, repetidas duas vezes (20 blocos,
 4 amostras por modo), cinco fixtures N=256. Médias em µs por operação:
+
+Estes tempos antecedem as fusões de publicação/reconcile de KERNEL-ABLATIONS.md;
+não são uma medição da fonte atual após essas mudanças.
 
 | Fixture | Produção | Full | Demand | Sycamore | Leptos |
 | --- | ---: | ---: | ---: | ---: | ---: |

@@ -11,17 +11,66 @@ mod support;
 
 /// Adapters preserve each library's native scheduling. Only our runtime needs
 /// an explicit flush; Leptos render effects and Sycamore effects are synchronous.
+trait CallbackView {
+    type Signal: Copy + 'static;
+    type Memo: Copy + 'static;
+    fn get(&self, signal: Self::Signal) -> u64;
+    fn read(&self, memo: Self::Memo) -> u64;
+}
+struct RuntimeView<'a, R>(&'a R);
+impl CallbackView for RuntimeView<'_, reactive::Runtime> {
+    type Signal = reactive::Signal<u64>;
+    type Memo = reactive::Memo<u64>;
+    fn get(&self, signal: Self::Signal) -> u64 {
+        signal.try_get_copy(self.0).unwrap()
+    }
+    fn read(&self, memo: Self::Memo) -> u64 {
+        memo.try_get_copy(self.0).unwrap()
+    }
+}
+impl CallbackView for RuntimeView<'_, typed_runtime_prototype::Runtime> {
+    type Signal = typed_runtime_prototype::Handle<u64>;
+    type Memo = typed_runtime_prototype::Handle<u64>;
+    fn get(&self, signal: Self::Signal) -> u64 {
+        self.0.get(signal).unwrap()
+    }
+    fn read(&self, memo: Self::Memo) -> u64 {
+        self.0.get(memo).unwrap()
+    }
+}
+struct SycamoreView;
+impl CallbackView for SycamoreView {
+    type Signal = sycamore_reactive::Signal<u64>;
+    type Memo = sycamore_reactive::ReadSignal<u64>;
+    fn get(&self, signal: Self::Signal) -> u64 {
+        signal.get()
+    }
+    fn read(&self, memo: Self::Memo) -> u64 {
+        memo.get()
+    }
+}
+struct LeptosView;
+impl CallbackView for LeptosView {
+    type Signal = leptos_reactive::RwSignal<u64>;
+    type Memo = leptos_reactive::Memo<u64>;
+    fn get(&self, signal: Self::Signal) -> u64 {
+        signal.get()
+    }
+    fn read(&self, memo: Self::Memo) -> u64 {
+        memo.get()
+    }
+}
 trait Engine: Sized {
     const NAME: &'static str;
     type Signal: Copy + 'static;
     type Memo: Copy + 'static;
+    type View<'a>: CallbackView<Signal = Self::Signal, Memo = Self::Memo>;
     fn new() -> Self;
     fn signal(&self, value: u64) -> Self::Signal;
     fn get(&self, signal: Self::Signal) -> u64;
     fn set(&self, signal: Self::Signal, value: u64);
-    fn memo(&self, f: impl Fn(&Self) -> u64 + 'static) -> Self::Memo;
-    fn read(&self, memo: Self::Memo) -> u64;
-    fn effect(&self, f: impl Fn(&Self) + 'static);
+    fn memo(&self, f: impl for<'a> Fn(&Self::View<'a>) -> u64 + 'static) -> Self::Memo;
+    fn effect(&self, f: impl for<'a> Fn(&Self::View<'a>) + 'static);
     fn settle(&self);
     fn reset_work(&self) {}
     fn work(&self) -> Option<serde_json::Value> {
@@ -38,6 +87,7 @@ impl Engine for Local {
     const NAME: &'static str = "reactive";
     type Signal = reactive::Signal<u64>;
     type Memo = reactive::Memo<u64>;
+    type View<'a> = RuntimeView<'a, reactive::Runtime>;
     fn new() -> Self {
         let runtime = reactive::Runtime::new();
         let owner = Some(runtime.create_root().unwrap());
@@ -54,30 +104,17 @@ impl Engine for Local {
     fn set(&self, signal: Self::Signal, value: u64) {
         signal.try_set(&self.runtime, value).unwrap();
     }
-    fn memo(&self, f: impl Fn(&Self) -> u64 + 'static) -> Self::Memo {
+    fn memo(&self, f: impl for<'a> Fn(&Self::View<'a>) -> u64 + 'static) -> Self::Memo {
         self.runtime
             .with_owner(self.owner.unwrap(), |rt| {
-                rt.memo_infallible(move |rt| {
-                    f(&Self {
-                        runtime: rt.clone(),
-                        owner: None,
-                    })
-                })
+                rt.memo_infallible(move |rt| f(&RuntimeView(rt)))
             })
             .unwrap()
     }
-    fn read(&self, memo: Self::Memo) -> u64 {
-        memo.try_get_copy(&self.runtime).unwrap()
-    }
-    fn effect(&self, f: impl Fn(&Self) + 'static) {
+    fn effect(&self, f: impl for<'a> Fn(&Self::View<'a>) + 'static) {
         self.runtime
             .with_owner(self.owner.unwrap(), |rt| {
-                rt.effect_infallible(move |rt| {
-                    f(&Self {
-                        runtime: rt.clone(),
-                        owner: None,
-                    })
-                })
+                rt.effect_infallible(move |rt| f(&RuntimeView(rt)))
             })
             .unwrap();
     }
@@ -120,6 +157,7 @@ impl Engine for Typed {
     const NAME: &'static str = "typed_research";
     type Signal = typed_runtime_prototype::Handle<u64>;
     type Memo = typed_runtime_prototype::Handle<u64>;
+    type View<'a> = RuntimeView<'a, typed_runtime_prototype::Runtime>;
     fn new() -> Self {
         let runtime = contracts::evaluation_strategy::runtime();
         let owner = Some(runtime.create_root().unwrap());
@@ -136,29 +174,18 @@ impl Engine for Typed {
     fn set(&self, signal: Self::Signal, value: u64) {
         self.runtime.set(signal, value).unwrap();
     }
-    fn memo(&self, f: impl Fn(&Self) -> u64 + 'static) -> Self::Memo {
+    fn memo(&self, f: impl for<'a> Fn(&Self::View<'a>) -> u64 + 'static) -> Self::Memo {
         self.runtime
             .with_owner(self.owner.unwrap(), |rt| {
-                rt.memo(move |rt| {
-                    Ok(f(&Self {
-                        runtime: rt.clone(),
-                        owner: None,
-                    }))
-                })
+                rt.memo(move |rt| Ok(f(&RuntimeView(rt))))
             })
             .unwrap()
     }
-    fn read(&self, memo: Self::Memo) -> u64 {
-        self.runtime.get(memo).unwrap()
-    }
-    fn effect(&self, f: impl Fn(&Self) + 'static) {
+    fn effect(&self, f: impl for<'a> Fn(&Self::View<'a>) + 'static) {
         self.runtime
             .with_owner(self.owner.unwrap(), |rt| {
                 rt.effect(move |rt| {
-                    f(&Self {
-                        runtime: rt.clone(),
-                        owner: None,
-                    });
+                    f(&RuntimeView(rt));
                     Ok(())
                 })
             })
@@ -188,6 +215,7 @@ impl Engine for Sycamore {
     const NAME: &'static str = "sycamore";
     type Signal = sycamore_reactive::Signal<u64>;
     type Memo = sycamore_reactive::ReadSignal<u64>;
+    type View<'a> = SycamoreView;
     fn new() -> Self {
         Self(Some(sycamore_reactive::create_root(|| {})))
     }
@@ -203,21 +231,18 @@ impl Engine for Sycamore {
     fn set(&self, signal: Self::Signal, value: u64) {
         signal.set(value);
     }
-    fn memo(&self, f: impl Fn(&Self) -> u64 + 'static) -> Self::Memo {
+    fn memo(&self, f: impl for<'a> Fn(&Self::View<'a>) -> u64 + 'static) -> Self::Memo {
         // selector, not create_memo: use PartialEq like the other engines.
         self.0
             .as_ref()
             .unwrap()
-            .run_in(|| sycamore_reactive::create_selector(move || f(&Self(None))))
+            .run_in(|| sycamore_reactive::create_selector(move || f(&SycamoreView)))
     }
-    fn read(&self, memo: Self::Memo) -> u64 {
-        memo.get()
-    }
-    fn effect(&self, f: impl Fn(&Self) + 'static) {
+    fn effect(&self, f: impl for<'a> Fn(&Self::View<'a>) + 'static) {
         self.0
             .as_ref()
             .unwrap()
-            .run_in(|| sycamore_reactive::create_effect(move || f(&Self(None))));
+            .run_in(|| sycamore_reactive::create_effect(move || f(&SycamoreView)));
     }
     fn settle(&self) {}
 }
@@ -234,6 +259,7 @@ impl Engine for Leptos {
     const NAME: &'static str = "leptos";
     type Signal = leptos_reactive::RwSignal<u64>;
     type Memo = leptos_reactive::Memo<u64>;
+    type View<'a> = LeptosView;
     fn new() -> Self {
         Self(Some(leptos_reactive::create_runtime()))
     }
@@ -246,14 +272,11 @@ impl Engine for Leptos {
     fn set(&self, signal: Self::Signal, value: u64) {
         signal.set(value);
     }
-    fn memo(&self, f: impl Fn(&Self) -> u64 + 'static) -> Self::Memo {
-        leptos_reactive::create_memo(move |_| f(&Self(None)))
+    fn memo(&self, f: impl for<'a> Fn(&Self::View<'a>) -> u64 + 'static) -> Self::Memo {
+        leptos_reactive::create_memo(move |_| f(&LeptosView))
     }
-    fn read(&self, memo: Self::Memo) -> u64 {
-        memo.get()
-    }
-    fn effect(&self, f: impl Fn(&Self) + 'static) {
-        leptos_reactive::create_render_effect(move |_| f(&Self(None)));
+    fn effect(&self, f: impl for<'a> Fn(&Self::View<'a>) + 'static) {
+        leptos_reactive::create_render_effect(move |_| f(&LeptosView));
     }
     fn settle(&self) {}
 }

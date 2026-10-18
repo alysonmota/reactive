@@ -874,32 +874,34 @@ impl Runtime {
             }
             header(g, key)?;
             // Stable reads need no buffer swap, retain, unlink or rebuilding.
-            // First validate ALL sources; only then update committed revisions.
-            // A tombstone, stale source or divergent prefix uses the full path.
-            let c = g.cold[key.index as usize].as_ref().unwrap();
+            // Update matched revisions while checking the stable prefix. If a
+            // later pair diverges, fallback replaces sources with reads; unlink
+            // uses only keys/backlink ordinals, never these revision fields.
+            // No callback or fallible operation observes the partial update.
+            let c = g.cold[key.index as usize].as_mut().unwrap();
             let mut state = State::Clean;
             let stable = c.tracking_prefix
                 && c.sources.len() == c.reads.len()
-                && c.sources.iter().zip(&c.reads).all(|(a, b)| {
+                && c.sources.iter_mut().zip(&c.reads).all(|(a, b)| {
                     if !a.live || a.key != b.key {
                         return false;
                     }
-                    let Ok(h) = header(g, b.key) else {
+                    let Some(h) = g.hot.get(b.key.index as usize) else {
                         return false;
                     };
+                    if !h.alive || h.generation != b.key.generation {
+                        return false;
+                    }
                     if h.revision != b.revision {
                         state = State::Dirty;
                     } else if h.freshness != b.freshness || h.state != State::Clean {
                         state = state.max(State::Check);
                     }
+                    a.revision = b.revision;
+                    a.freshness = b.freshness;
                     true
                 });
             if stable {
-                let c = g.cold[key.index as usize].as_mut().unwrap();
-                for (old, new) in c.sources.iter_mut().zip(&c.reads) {
-                    old.revision = new.revision;
-                    old.freshness = new.freshness;
-                }
                 c.reads.clear();
                 let h = header_mut(g, key)?;
                 h.state = state;
@@ -1246,7 +1248,28 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
     }
     // Callback may have disposed this allocation and reused its index. It is
     // legal to retain the raw address, but NEVER dereference it after disposal.
-    let alive = rt.graph(|g| header(g, key).is_ok());
+    let (alive, preflight) = rt.graph(|g| {
+        let Ok(h) = header(g, key) else {
+            return (false, Ok(()));
+        };
+        let result = (|| {
+            if matches!(&outcome, Ok(Ok(_))) && h.kind == Kind::Memo {
+                for source in &g.cold[key.index as usize].as_ref().unwrap().reads {
+                    let h = header(g, source.key)?;
+                    if h.revision != source.revision
+                        || h.freshness != source.freshness
+                        || h.state != State::Clean
+                    {
+                        return Err(Error::InvariantViolation(
+                            "memo source changed after first read",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        (true, result)
+    });
     if alive {
         // SAFETY: generational life revalidated; callback cannot substitute the
         // allocation for a live key, and no &Typed<T> crossed user code.
@@ -1279,22 +1302,9 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
     rt.check(READ)?;
     // Pure memo completion must not publish a candidate based on a stale first
     // read. Effects deliberately use the separate writable completion protocol.
-    rt.graph(|g| {
-        if header(g, key)?.kind == Kind::Memo {
-            for source in &g.cold[key.index as usize].as_ref().unwrap().reads {
-                let h = header(g, source.key)?;
-                if h.revision != source.revision
-                    || h.freshness != source.freshness
-                    || h.state != State::Clean
-                {
-                    return Err(Error::InvariantViolation(
-                        "memo source changed after first read",
-                    ));
-                }
-            }
-        }
-        Ok(())
-    })?;
+    // Restore compute and protect the candidate before propagating a saved
+    // preflight error; the original compute error/panic still takes precedence.
+    preflight?;
     let changed = {
         let _caps = Caps::pure(0);
         let _reader = ReaderRuntime::enter(None);
@@ -1306,27 +1316,25 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
     };
     rt.check(READ)?;
     if changed {
-        let revision = rt.graph(|g| {
-            header(g, key)?
-                .revision
-                .checked_add(1)
-                .ok_or(Error::Exhausted)
-        });
-        let revision = revision?;
-        // SAFETY: no references to T remain, callback/equals have ended. Write
-        // the alternate slot, publish its index, extract old T before Drop.
-        let old = unsafe {
-            let cell = ptr.as_ref();
-            let next = 1 - cell.current.get();
-            let values = &mut *cell.values.get();
-            values[next] = candidate.1.take();
-            let old = values[cell.current.get()].take();
-            cell.current.set(next);
-            old
-        };
-        rt.graph(|g| {
-            header_mut(g, key).unwrap().revision = revision;
-        });
+        let old = rt.graph(|g| {
+            let h = header_mut(g, key)?;
+            let revision = h.revision.checked_add(1).ok_or(Error::Exhausted)?;
+            // SAFETY: the full Key was resolved after equals; no callback or
+            // reference to T crosses this kernel. The alternate slot is empty.
+            // Preflight overflow BEFORE any publication; retire old T outside
+            // the kernel so its destructor can reenter/dispose safely.
+            let old = unsafe {
+                let cell = ptr.as_ref();
+                let next = 1 - cell.current.get();
+                let values = &mut *cell.values.get();
+                values[next] = candidate.1.take();
+                let old = values[cell.current.get()].take();
+                cell.current.set(next);
+                old
+            };
+            h.revision = revision;
+            Ok(old)
+        })?;
         rt.retire(old);
     }
     Ok(changed)

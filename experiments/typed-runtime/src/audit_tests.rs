@@ -163,6 +163,176 @@ fn fault_injected_stale_memo_read_and_clean_source_overflow_do_not_publish() {
 }
 
 #[test]
+fn memo_revision_overflow_keeps_current_slot_and_drops_only_candidate() {
+    struct Value(u32, Rc<RefCell<Vec<u32>>>);
+    impl Drop for Value {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+    let (r, o) = pair();
+    let source = signal(&r, o, 1);
+    let drops = Rc::new(RefCell::new(Vec::new()));
+    let captured = drops.clone();
+    let m = r
+        .with_owner(o, |r| {
+            r.memo_with(
+                move |r| Ok(Value(r.get(source)?, captured.clone())),
+                |a, b| a.0 == b.0,
+            )
+        })
+        .unwrap();
+    assert_eq!(r.with(m, |v| v.0), Ok(1));
+    let inspect = || {
+        r.graph(|g| {
+            header(g, m.key).unwrap();
+            let ptr = g.cold[m.key.index as usize].as_ref().unwrap().value;
+            // SAFETY: test-private typed handle is live; no callback or mutation
+            // occurs while inspecting its current and alternate slots.
+            unsafe {
+                let cell = ptr.cast::<Typed<Value>>().as_ref();
+                let values = &*cell.values.get();
+                let current = cell.current.get();
+                (
+                    current,
+                    values[current].as_ref().unwrap().0,
+                    values[1 - current].is_none(),
+                )
+            }
+        })
+    };
+    let before = inspect();
+    r.set(source, 2).unwrap();
+    r.graph(|g| header_mut(g, m.key).unwrap().revision = u64::MAX);
+    assert_eq!(r.with(m, |v| v.0), Err(Error::Exhausted));
+    assert_eq!(inspect(), before);
+    assert_eq!(&*drops.borrow(), &[2]);
+    assert_eq!(r.graph(|g| header(g, m.key).unwrap().revision), u64::MAX);
+    r.verify_invariants().unwrap();
+    r.shutdown().unwrap();
+    assert_eq!(&*drops.borrow(), &[2, 1]);
+}
+
+#[test]
+fn reconcile_updated_prefix_then_divergent_tail_repairs_backlinks() {
+    let (r, o) = pair();
+    let first = signal(&r, o, 1);
+    let left = signal(&r, o, 10);
+    let right = signal(&r, o, 100);
+    let use_right = Rc::new(Cell::new(false));
+    let choice = use_right.clone();
+    let m = memo(&r, o, move |r| {
+        let value = r.get(first)? + r.get(if choice.get() { right } else { left })?;
+        // Test-private optimistic certificate: force the stable-path scan to
+        // reach the divergent second pair after copying the first revision.
+        // Normal tracking would already have cleared this prefix flag.
+        let reader = r.0.reader.get().unwrap();
+        r.graph(|g| {
+            g.cold[reader.index as usize]
+                .as_mut()
+                .unwrap()
+                .tracking_prefix = true
+        });
+        Ok(value)
+    });
+    assert_eq!(r.get(m), Ok(11));
+    use_right.set(true);
+    r.set(first, 2).unwrap();
+    assert_eq!(r.get(m), Ok(102));
+    r.verify_invariants().unwrap();
+    assert!(r.graph(|g| {
+        g.cold[left.key.index as usize]
+            .as_ref()
+            .unwrap()
+            .observers
+            .is_empty()
+    }));
+    r.set(left, 20).unwrap();
+    assert_eq!(r.graph(|g| header(g, m.key).unwrap().state), State::Clean);
+    r.set(right, 200).unwrap();
+    assert_eq!(r.get(m), Ok(202));
+    r.verify_invariants().unwrap();
+}
+
+#[test]
+fn nested_dirty_memo_restores_phase_after_success_error_unwind_and_cleanup_failure() {
+    for outcome in 0..4 {
+        let (r, o) = pair();
+        let source = signal(&r, o, 1);
+        let armed = Rc::new(Cell::new(false));
+        let flag = armed.clone();
+        let m = memo(&r, o, move |r| {
+            let value = r.get(source)?;
+            if flag.get() {
+                match outcome {
+                    1 => return Err(Error::CallbackFailed("nested dirty")),
+                    2 => panic!("nested dirty"),
+                    _ => (),
+                }
+            }
+            Ok(value)
+        });
+        assert_eq!(r.get(m), Ok(1));
+        if outcome == 3 {
+            let scope = materialized_scope(&r, m.key);
+            let previous = r.0.owner.replace(Some(scope));
+            r.on_cleanup(|_| Err(Error::CallbackFailed("nested cleanup")))
+                .unwrap();
+            r.0.owner.set(previous);
+        }
+        armed.set(true);
+        r.set(source, 2).unwrap();
+        let aggregate = memo(&r, o, move |r| r.get(m));
+        let result = catch_unwind(AssertUnwindSafe(|| r.get(aggregate)));
+        match outcome {
+            0 => assert_eq!(result.unwrap(), Ok(2)),
+            1 => assert_eq!(result.unwrap(), Err(Error::CallbackFailed("nested dirty"))),
+            2 => assert!(result.is_err()),
+            _ => assert_eq!(
+                result.unwrap(),
+                Err(Error::CallbackFailed("nested cleanup"))
+            ),
+        }
+        for key in [m.key, aggregate.key] {
+            assert_eq!(
+                r.graph(|g| header(g, key).unwrap().phase),
+                EvaluationPhase::Idle
+            );
+        }
+        assert_eq!(r.0.depth.get(), 0);
+        assert_eq!(r.0.reader.get(), None);
+        assert_eq!(r.0.pending_owner.get(), None);
+        r.verify_invariants().unwrap();
+        r.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn reconcile_rechecks_source_freshness_after_comparator_fault_injection() {
+    let (r, o) = pair();
+    let source = signal(&r, o, 1);
+    let captured = r.clone();
+    let m = r
+        .with_owner(o, |r| {
+            r.memo_with(
+                move |r| r.get(source),
+                move |a, b| {
+                    // Private corruption after the successful first-read preflight.
+                    captured.graph(|g| header_mut(g, source.key).unwrap().freshness += 1);
+                    a == b
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(r.get(m), Ok(1));
+    r.set(source, 2).unwrap();
+    r.update(m.key).unwrap();
+    assert_eq!(r.graph(|g| header(g, m.key).unwrap().state), State::Check);
+    r.verify_invariants().unwrap();
+    r.shutdown().unwrap();
+}
+
+#[test]
 fn identity_exhaustion_and_parallel_allocation_never_wrap() {
     let counter = AtomicU64::new(u64::MAX - 1);
     assert_eq!(allocate_identity(&counter), Ok(u64::MAX - 1));
