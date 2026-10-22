@@ -3,6 +3,9 @@
 > Atribuição posterior da fonte final, sem mudar runtime:
 > [FINAL-CALLSITE.md](FINAL-CALLSITE.md).
 
+> Experimento posterior de continuação de subida, rejeitado sem alterar o
+> runtime final: [ASCENT-PLAN.md](ASCENT-PLAN.md).
+
 ## Método e estado
 
 Controle inicial: `kernel-final-directed`, já contendo publicação fundida e

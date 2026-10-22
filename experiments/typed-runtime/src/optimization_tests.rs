@@ -1,6 +1,194 @@
 use super::*;
 use production_support::{effect, flush, forge, memo, pair, signal};
 
+#[test]
+fn ascent_equal_chain_skips_callbacks_and_resumes_remaining_sources() {
+    for mode in [
+        EvaluationStrategy::FullFrames,
+        EvaluationStrategy::DemandDriven,
+    ] {
+        let r = Runtime::with_evaluation_strategy(mode);
+        let o = r.create_root().unwrap();
+        let input = signal(&r, o, 0_u64);
+        let other = signal(&r, o, 10_u64);
+        let calls = Rc::new(Cell::new(0));
+        let leaf = memo(&r, o, move |r| Ok(r.get(input)? / 10));
+        let mut end = leaf;
+        for _ in 0..24 {
+            let previous = end;
+            let calls = calls.clone();
+            end = memo(&r, o, move |r| {
+                calls.set(calls.get() + 1);
+                r.get(previous)
+            });
+        }
+        // Exercise both a remaining source after the equal child and ascent
+        // after the LAST source. No observer may run merely because of Check.
+        let first = memo(&r, o, move |r| Ok(r.get(end)? + r.get(other)?));
+        let last = memo(&r, o, move |r| Ok(r.get(other)? + r.get(end)?));
+        let output = Rc::new(Cell::new(0));
+        let seen = output.clone();
+        effect(&r, o, move |r| {
+            seen.set(r.get(first)? + r.get(last)?);
+            Ok(())
+        });
+        flush(&r);
+        assert_eq!(calls.get(), 24);
+        assert_eq!(output.get(), 20);
+        for n in 1..4 {
+            r.set(input, n).unwrap();
+            flush(&r);
+            assert_eq!(calls.get(), 24);
+            assert_eq!(output.get(), 20);
+            r.verify_invariants().unwrap();
+        }
+        // Equality in the first source must not hide a changed later source.
+        r.set(input, 4).unwrap();
+        r.set(other, 20).unwrap();
+        flush(&r);
+        assert_eq!(output.get(), 40);
+        assert_eq!(calls.get(), 24);
+        r.set(input, 10).unwrap();
+        flush(&r);
+        assert_eq!(output.get(), 42);
+        assert_eq!(calls.get(), 48);
+        assert!(r.0.frames.borrow().is_empty());
+        assert!(r.0.fused_frames.borrow().is_empty());
+        r.verify_invariants().unwrap();
+        r.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn ascent_equal_source_does_not_clean_a_dirty_reader() {
+    for mode in [
+        EvaluationStrategy::FullFrames,
+        EvaluationStrategy::DemandDriven,
+    ] {
+        let r = Runtime::with_evaluation_strategy(mode);
+        let o = r.create_root().unwrap();
+        let input = signal(&r, o, 0_u64);
+        let target = Rc::new(Cell::new(None::<Key>));
+        let saved = target.clone();
+        let leaf = memo(&r, o, move |r| {
+            if r.get(input)? != 0 {
+                // Synthetic host mutation isolates the Dirty gate on ascent.
+                r.graph(|g| header_mut(g, saved.get().unwrap()).unwrap().state = State::Dirty);
+            }
+            Ok(1_u64)
+        });
+        let middle = memo(&r, o, move |r| r.get(leaf));
+        let calls = Rc::new(Cell::new(0));
+        let seen = calls.clone();
+        let parent = memo(&r, o, move |r| {
+            seen.set(seen.get() + 1);
+            r.get(middle)
+        });
+        target.set(Some(parent.key));
+        assert_eq!(r.get(parent), Ok(1));
+        r.set(input, 1).unwrap();
+        assert_eq!(r.get(parent), Ok(1));
+        assert_eq!(calls.get(), 2);
+        r.verify_invariants().unwrap();
+        r.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn ascent_revalidates_reader_source_and_overflow_before_cleaning() {
+    for mode in [
+        EvaluationStrategy::FullFrames,
+        EvaluationStrategy::DemandDriven,
+    ] {
+        for fault in 0..3 {
+            let r = Runtime::with_evaluation_strategy(mode);
+            let o = r.create_root().unwrap();
+            let input = signal(&r, o, 0_u64);
+            let target = Rc::new(Cell::new(None::<Key>));
+            let saved = target.clone();
+            let leaf = memo(&r, o, move |r| {
+                if r.get(input)? != 0 {
+                    // Synthetic faults in a grandparent: the immediate parent
+                    // must finish checking before the new ascent reaches it.
+                    r.graph(|g| {
+                        let key = saved.get().unwrap();
+                        match fault {
+                            0 => g.hot[key.index as usize].generation += 1,
+                            1 => {
+                                let source =
+                                    g.cold[key.index as usize].as_ref().unwrap().sources[0];
+                                g.hot[source.key.index as usize].generation += 1;
+                            }
+                            _ => {
+                                let source =
+                                    g.cold[key.index as usize].as_ref().unwrap().sources[0];
+                                g.hot[key.index as usize].freshness = u64::MAX;
+                                g.hot[source.key.index as usize].revision += 1;
+                            }
+                        }
+                    });
+                }
+                Ok(1_u64)
+            });
+            let middle = memo(&r, o, move |r| r.get(leaf));
+            let parent = memo(&r, o, move |r| r.get(middle));
+            target.set(Some(parent.key));
+            assert_eq!(r.get(parent), Ok(1));
+            let (source, freshness) = r.graph(|g| {
+                (
+                    g.cold[parent.key.index as usize].as_ref().unwrap().sources[0],
+                    g.hot[parent.key.index as usize].freshness,
+                )
+            });
+            r.set(input, 1).unwrap();
+            assert_eq!(
+                r.get(parent),
+                Err(if fault == 2 {
+                    Error::Exhausted
+                } else {
+                    Error::InvalidHandle
+                }),
+                "mode={mode:?}, fault={fault}"
+            );
+            assert!(r.0.frames.borrow().is_empty());
+            assert!(r.0.fused_frames.borrow().is_empty());
+            assert_eq!(r.0.depth.get(), 0);
+            assert_eq!(r.0.reader.get(), None);
+            assert_eq!(r.0.owner.get(), None);
+            assert_eq!(r.0.pending_owner.get(), None);
+            assert_eq!(CAPS.get(), ALL);
+            assert!(!PURE.get());
+            r.graph(|g| {
+                let h = &mut g.hot[parent.key.index as usize];
+                if fault == 0 {
+                    // Checked recovery must NOT touch the reused generation.
+                    assert_eq!(h.generation, parent.key.generation + 1);
+                    assert_eq!(h.phase, EvaluationPhase::Checking);
+                    h.generation = parent.key.generation;
+                    h.phase = EvaluationPhase::Idle;
+                } else {
+                    assert_eq!(h.phase, EvaluationPhase::Idle);
+                    assert_eq!(h.state, State::Dirty);
+                }
+                h.freshness = freshness;
+                if fault == 1 {
+                    let h = &mut g.hot[middle.key.index as usize];
+                    assert_eq!(h.generation, middle.key.generation + 1);
+                    assert_eq!(h.phase, EvaluationPhase::Checking);
+                    h.generation = middle.key.generation;
+                    h.phase = EvaluationPhase::Idle;
+                }
+                if fault == 2 {
+                    g.hot[middle.key.index as usize].revision = source.revision;
+                }
+                g.cold[parent.key.index as usize].as_mut().unwrap().sources[0] = source;
+            });
+            r.verify_invariants().unwrap();
+            r.shutdown().unwrap();
+        }
+    }
+}
+
 fn arena(r: &Runtime) -> (usize, *const ()) {
     assert!(r.0.frames.borrow().is_empty());
     assert!(r.0.fused_frames.borrow().is_empty());

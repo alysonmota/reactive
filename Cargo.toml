@@ -13,9 +13,33 @@ default = []
 diagnostics = []
 verification = []
 experimental-inline-reads = ["dep:smallvec"]
+paint-flash = []
 
 [dependencies]
+wgpu = "0.19"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+raw-window-handle = "0.6"
+vello_cpu = { version = "0.3", default-features = false, features = [
+  "std",
+  "u8_pipeline",
+] }
+
 smallvec = { version = "=1.16.3", optional = true }
+taffy = { version = "0.15.0", default-features = false, features = [
+  "std",
+  "flexbox",
+  "taffy_tree",
+] }
+tiny-skia = "0.12"
+cosmic-text = "0.19"
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+memmap2 = "0.9"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 typed-runtime-prototype = { path = "experiments/typed-runtime" }

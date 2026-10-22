@@ -7,6 +7,18 @@
 
 ## Subsequent optimization review
 
+### Rejected experiment: callback-free upward continuation
+
+The bounded ascent trial in `../../benches/ASCENT-PLAN.md` was rejected for
+performance after both variants passed native and directed Miri gates. Its
+runtime changes were removed; fused.rs is byte-identical to the pre-trial
+control. The variants kept reader epoch certificates, source generation checks,
+checked recovery, callback boundaries and the existing pop protocol. Their
+archived validation does NOT establish a new active implementation or an
+independent unsafe approval. Three directed regression tests remain: equal
+chains with remaining sources, a Dirty reader despite an equal source, and
+grandparent/source generation plus freshness-overflow faults during resumption.
+
 ### Current follow-up: logical prepare inside the fused kernel
 
 The measured outlined variant was reapplied byte-identically. Demand prepares

@@ -20,6 +20,9 @@ CASES = [
     'optimization_tests::committed_chain_reuses_iterative_frames_and_respects_logical_depth_limit',
     'audit_tests::nested_dirty_memo_restores_phase_after_success_error_unwind_and_cleanup_failure',
     'audit_tests::reconcile_rechecks_source_freshness_after_comparator_fault_injection',
+    'optimization_tests::ascent_equal_chain_skips_callbacks_and_resumes_remaining_sources',
+    'optimization_tests::ascent_equal_source_does_not_clean_a_dirty_reader',
+    'optimization_tests::ascent_revalidates_reader_source_and_overflow_before_cleaning',
     'fused::tests::',
 ]
 
