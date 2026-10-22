@@ -91,6 +91,7 @@ pub(super) fn update(rt: &Runtime, key: Key) -> Result<()> {
     result
 }
 impl Session<'_> {
+    #[inline(always)]
     fn push(
         &mut self,
         g: &mut Graph,
@@ -251,6 +252,7 @@ impl Session<'_> {
             return Ok(Action::Execute(key, f.kind, executable));
         }
     }
+    #[inline(always)]
     fn pop(&self, g: &mut Graph, frames: &mut Vec<Frame>, trust: bool) {
         let f = frames.pop().unwrap();
         // Err/unwind and immediate callback return ALWAYS take the checked
@@ -333,9 +335,7 @@ impl Session<'_> {
             unsafe {
                 execute(value, rt, key)?;
             }
-            if rt.graph(|g| header(g, key).is_ok()) {
-                rt.reconcile(key)?;
-            }
+            rt.reconcile_live(key)?;
         }
         Ok(())
     }

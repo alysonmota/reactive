@@ -322,8 +322,15 @@ fn header(g: &Graph, key: Key) -> Result<&Hot> {
     }
 }
 fn header_mut(g: &mut Graph, key: Key) -> Result<&mut Hot> {
-    header(g, key)?;
-    Ok(&mut g.hot[key.index as usize])
+    let h = g
+        .hot
+        .get_mut(key.index as usize)
+        .ok_or(Error::InvalidHandle)?;
+    if h.alive && h.generation == key.generation {
+        Ok(h)
+    } else {
+        Err(Error::InvalidHandle)
+    }
 }
 
 impl Default for Runtime {
@@ -867,7 +874,18 @@ impl Runtime {
         }
     }
     fn reconcile(&self, key: Key) -> Result<()> {
+        self.reconcile_with(key, false).map(|_| ())
+    }
+    /// Reconciles only a still-live node, in ONE graph kernel. Equivalent to a
+    /// separate liveness kernel followed by `reconcile`: no user code intervenes.
+    fn reconcile_live(&self, key: Key) -> Result<()> {
+        self.reconcile_with(key, true).map(|_| ())
+    }
+    fn reconcile_with(&self, key: Key, skip_dead: bool) -> Result<bool> {
         let result = self.graph(|g| {
+            if skip_dead && header(g, key).is_err() {
+                return Ok(false);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 g.work.reconciliations = g.work.reconciliations.saturating_add(1);
@@ -903,10 +921,12 @@ impl Runtime {
                 });
             if stable {
                 c.reads.clear();
-                let h = header_mut(g, key)?;
+                // `key` was resolved at the top of this same kernel and nothing
+                // in the stable path can retire it.
+                let h = &mut g.hot[key.index as usize];
                 h.state = state;
                 h.initialized = true;
-                return Ok(());
+                return Ok(true);
             }
             // Move reusable buffers out, do not allocate or drop user payloads.
             let c = g.cold[key.index as usize].as_mut().unwrap();
@@ -953,12 +973,13 @@ impl Runtime {
             let c = g.cold[key.index as usize].as_mut().unwrap();
             c.sources = new;
             c.reads = old;
-            header_mut(g, key)?.state = state;
-            header_mut(g, key)?.initialized = true;
-            Ok(())
+            let h = header_mut(g, key)?;
+            h.state = state;
+            h.initialized = true;
+            Ok(true)
         });
         #[cfg(feature = "topology-diagnostics")]
-        if result.is_ok() && self.0.topology_enabled.get() {
+        if matches!(result, Ok(true)) && self.0.topology_enabled.get() {
             topology::completed(self, key);
         }
         result
