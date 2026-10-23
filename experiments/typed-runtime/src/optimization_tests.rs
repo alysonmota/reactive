@@ -1,5 +1,5 @@
 use super::*;
-use production_support::{effect, flush, forge, memo, pair, signal};
+use production_support::{effect, flush, forge, memo, pair, revisions, signal};
 
 #[test]
 fn ascent_equal_chain_skips_callbacks_and_resumes_remaining_sources() {
@@ -595,4 +595,73 @@ fn snapshots_materialize_owner_identities_without_evaluating_values() {
     assert_eq!(calls.get(), 1);
     assert_eq!(r.owner_count(), 2);
     r.verify_invariants().unwrap();
+}
+
+#[test]
+fn only_std_primitive_comparators_are_trusted() {
+    assert!(Equality::<u64>::partial_eq().is_trusted());
+    assert!(Equality::<bool>::partial_eq().is_trusted());
+    assert!(Equality::<f64>::partial_eq().is_trusted());
+    assert!(Equality::<()>::partial_eq().is_trusted());
+    // Not primitives: their PartialEq is user-visible code.
+    assert!(!Equality::<String>::partial_eq().is_trusted());
+    assert!(!Equality::<(u64, u64)>::partial_eq().is_trusted());
+    assert!(!Equality::<Option<u64>>::partial_eq().is_trusted());
+    assert!(!Equality::<u64>::Function(|a, b| a == b).is_trusted());
+    assert!(!Equality::<u64>::Captured(Box::new(|a, b| a == b)).is_trusted());
+}
+
+#[test]
+fn primitive_and_user_comparators_publish_identically() {
+    for mode in [
+        EvaluationStrategy::FullFrames,
+        EvaluationStrategy::DemandDriven,
+    ] {
+        let r = Runtime::with_evaluation_strategy(mode);
+        let o = r.create_root().unwrap();
+        let input = signal(&r, o, 0_u64);
+        // Same computation; `trusted` takes the one-kernel path, `user` the
+        // general path through a caller-supplied comparator.
+        let trusted = memo(&r, o, move |r| Ok(r.get(input)? / 3));
+        let user = r
+            .with_owner(o, |r| {
+                r.memo_with(move |r| Ok(r.get(input)? / 3), |a: &u64, b: &u64| a == b)
+            })
+            .unwrap();
+        let runs = Rc::new(Cell::new((0, 0)));
+        let seen = runs.clone();
+        effect(&r, o, move |r| {
+            let (a, b) = seen.get();
+            seen.set((a + 1, b));
+            r.get(trusted)?;
+            Ok(())
+        });
+        let seen = runs.clone();
+        effect(&r, o, move |r| {
+            let (a, b) = seen.get();
+            seen.set((a, b + 1));
+            r.get(user)?;
+            Ok(())
+        });
+        flush(&r);
+        assert_eq!(runs.get(), (1, 1));
+        let before = (revisions(&r, trusted).0, revisions(&r, user).0);
+        for n in [1_u64, 2] {
+            // Equal after the division: no publication, no observer rerun.
+            r.set(input, n).unwrap();
+            flush(&r);
+            assert_eq!(runs.get(), (1, 1));
+            // Value revisions only: freshness legitimately advances on equal cuts.
+            assert_eq!(before, (revisions(&r, trusted).0, revisions(&r, user).0));
+        }
+        r.set(input, 3).unwrap();
+        flush(&r);
+        assert_eq!(runs.get(), (2, 2));
+        assert_eq!(r.get(trusted).unwrap(), 1);
+        assert_eq!(r.get(user).unwrap(), 1);
+        assert_eq!(revisions(&r, trusted).0 - before.0, 1);
+        assert_eq!(revisions(&r, user).0 - before.1, 1);
+        r.verify_invariants().unwrap();
+        r.shutdown().unwrap();
+    }
 }

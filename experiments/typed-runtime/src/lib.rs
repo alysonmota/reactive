@@ -238,13 +238,52 @@ type Comparator<T> = Box<dyn Fn(&T, &T) -> bool>;
 enum Equality<T> {
     Function(fn(&T, &T) -> bool),
     Captured(Comparator<T>),
+    /// `PartialEq::eq` of a std primitive. Runs no user code, cannot panic and
+    /// cannot touch any runtime, so callers may skip the user-code protections.
+    Primitive(fn(&T, &T) -> bool),
 }
 impl<T> Equality<T> {
     fn equal(&self, a: &T, b: &T) -> bool {
         match self {
-            Self::Function(f) => f(a, b),
+            Self::Function(f) | Self::Primitive(f) => f(a, b),
             Self::Captured(f) => f(a, b),
         }
+    }
+    fn is_trusted(&self) -> bool {
+        matches!(self, Self::Primitive(_))
+    }
+}
+impl<T: PartialEq + 'static> Equality<T> {
+    /// Default equality: trusted only for std primitives, whose `eq` is not user code.
+    fn partial_eq() -> Self {
+        macro_rules! primitive {
+            ($($t:ty),*) => {
+                let id = TypeId::of::<T>();
+                if false $(|| id == TypeId::of::<$t>())* {
+                    return Self::Primitive(T::eq);
+                }
+            };
+        }
+        primitive!(
+            bool,
+            char,
+            u8,
+            u16,
+            u32,
+            u64,
+            u128,
+            usize,
+            i8,
+            i16,
+            i32,
+            i64,
+            i128,
+            isize,
+            f32,
+            f64,
+            ()
+        );
+        Self::Function(T::eq)
     }
 }
 impl<T> Typed<T> {
@@ -604,7 +643,7 @@ impl Runtime {
         })
     }
     pub fn signal<T: PartialEq + 'static>(&self, value: T) -> Result<Handle<T>> {
-        self.insert(Some(value), None, Kind::Signal, Equality::Function(T::eq))
+        self.insert(Some(value), None, Kind::Signal, Equality::partial_eq())
     }
     pub fn signal_with<T: 'static>(
         &self,
@@ -626,7 +665,7 @@ impl Runtime {
             None,
             Some(Box::new(compute)),
             Kind::Memo,
-            Equality::Function(T::eq),
+            Equality::partial_eq(),
         )
     }
     pub fn memo_with<T: 'static>(
@@ -649,7 +688,7 @@ impl Runtime {
             None,
             Some(Box::new(move |rt| callback(rt))),
             Kind::Effect,
-            Equality::Function(<()>::eq),
+            Equality::partial_eq(),
         )
     }
     fn resolve<T: 'static>(&self, handle: Handle<T>) -> Result<NonNull<Typed<T>>> {
@@ -1256,6 +1295,11 @@ fn unlink(g: &mut Graph, source: Source, reader: Key) {
     }
 }
 
+enum Fast<T> {
+    Slow,
+    Failed(Error),
+    Done(bool, Option<T>),
+}
 unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Result<bool> {
     let ptr = ptr.cast::<Typed<T>>();
     // SAFETY: descriptor is monomorphized for the pinned allocation's T.
@@ -1266,6 +1310,89 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
         Ok(Err(e)) => rt.record_failure(*e),
         Err(_) => rt.record_failure(Error::Panic),
         _ => (),
+    }
+    // Fast path: successful memo with a primitive comparator. The comparator is
+    // not user code, so liveness, status, the first-read preflight, comparison
+    // and publication form ONE graph kernel instead of two. Anything else (dead
+    // node, effect, user comparator) leaves everything untouched and takes the
+    // general path below.
+    if matches!(outcome, Ok(Ok(_))) {
+        let Ok(Ok(value)) = outcome else {
+            unreachable!()
+        };
+        let mut candidate = Protected(rt, Some(value));
+        let step = rt.graph(|g| {
+            let Ok(h) = header(g, key) else {
+                return Fast::Slow;
+            };
+            // SAFETY: header() just proved this generation alive in this kernel.
+            let cell = unsafe { ptr.as_ref() };
+            if h.kind != Kind::Memo || !cell.equals.is_trusted() {
+                return Fast::Slow;
+            }
+            // Same precedence as the general path: status, then preflight.
+            if let Err(error) = rt.check(READ) {
+                return Fast::Failed(error);
+            }
+            for source in &g.cold[key.index as usize].as_ref().unwrap().reads {
+                match header(g, source.key) {
+                    Ok(h)
+                        if h.revision == source.revision
+                            && h.freshness == source.freshness
+                            && h.state == State::Clean => {}
+                    Ok(_) => {
+                        return Fast::Failed(Error::InvariantViolation(
+                            "memo source changed after first read",
+                        ));
+                    }
+                    Err(error) => return Fast::Failed(error),
+                }
+            }
+            // SAFETY: alive; the primitive comparator runs no user code.
+            let changed = unsafe {
+                (&*cell.values.get())[cell.current.get()]
+                    .as_ref()
+                    .is_none_or(|old| !cell.equals.equal(old, candidate.1.as_ref().unwrap()))
+            };
+            if !changed {
+                return Fast::Done(false, None);
+            }
+            let h = &mut g.hot[key.index as usize];
+            let Some(revision) = h.revision.checked_add(1) else {
+                return Fast::Failed(Error::Exhausted);
+            };
+            // SAFETY: as in the general publication below.
+            let old = unsafe {
+                let next = 1 - cell.current.get();
+                let values = &mut *cell.values.get();
+                values[next] = candidate.1.take();
+                let old = values[cell.current.get()].take();
+                cell.current.set(next);
+                old
+            };
+            h.revision = revision;
+            Fast::Done(true, old)
+        });
+        match step {
+            Fast::Slow => outcome = Ok(Ok(candidate.1.take().unwrap())),
+            Fast::Failed(error) => {
+                // SAFETY: the kernel proved liveness and no user code ran since.
+                unsafe {
+                    *ptr.as_ref().compute.get() = Some(compute);
+                }
+                return Err(error);
+            }
+            Fast::Done(changed, old) => {
+                // SAFETY: as above.
+                unsafe {
+                    *ptr.as_ref().compute.get() = Some(compute);
+                }
+                if changed {
+                    rt.retire(old);
+                }
+                return Ok(changed);
+            }
+        }
     }
     // Callback may have disposed this allocation and reused its index. It is
     // legal to retain the raw address, but NEVER dereference it after disposal.
@@ -1326,16 +1453,26 @@ unsafe fn execute<T: 'static>(ptr: NonNull<()>, rt: &Runtime, key: Key) -> Resul
     // Restore compute and protect the candidate before propagating a saved
     // preflight error; the original compute error/panic still takes precedence.
     preflight?;
-    let changed = {
-        let _caps = Caps::pure(0);
-        let _reader = ReaderRuntime::enter(None);
-        rt.user(|| unsafe {
-            let cell = ptr.as_ref();
-            let old = (&*cell.values.get())[cell.current.get()].as_ref();
-            old.is_none_or(|old| !cell.equals.equal(old, candidate.1.as_ref().unwrap()))
-        })
+    let compare = || unsafe {
+        let cell = ptr.as_ref();
+        let old = (&*cell.values.get())[cell.current.get()].as_ref();
+        old.is_none_or(|old| !cell.equals.equal(old, candidate.1.as_ref().unwrap()))
     };
-    rt.check(READ)?;
+    // SAFETY: allocation is alive (checked above) and no user code ran since.
+    // A primitive comparator is not user code: it cannot panic, poison, shut
+    // down or reenter, so neither the guards nor the follow-up check can differ.
+    let trusted = unsafe { ptr.as_ref() }.equals.is_trusted();
+    let changed = if trusted {
+        compare()
+    } else {
+        let changed = {
+            let _caps = Caps::pure(0);
+            let _reader = ReaderRuntime::enter(None);
+            rt.user(compare)
+        };
+        rt.check(READ)?;
+        changed
+    };
     if changed {
         let old = rt.graph(|g| {
             let h = header_mut(g, key)?;
